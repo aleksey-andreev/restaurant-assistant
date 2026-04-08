@@ -1,0 +1,14 @@
+nodes:
+  default_dialog:
+    # base_url можно не указывать, если используется CLOUDRU_FOUNDATION_MODELS_URL
+    api_key_env: "CLOUDRU_FOUNDATION_MODELS_API_KEY"
+    model: "ai-sage/GigaChat3-10B-A1.8B"
+    max_tokens: 2500
+    temperature: 0.5
+    presence_penalty: 0.0
+    top_p: 0.95
+    system_prompt: >
+      Ты – умный ассистент по выбору ресторана.
+      Помоги пользователю подобрать ресторан, забронировать столик и
+      оформить предварительный заказ, опираясь на его предпочтения.
+

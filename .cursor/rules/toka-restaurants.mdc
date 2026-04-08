@@ -1,0 +1,12 @@
+---
+description: Эндпоинты поиска ресторанов Toka — заглушки по дизайну
+globs: backend/app/routers/restaurants.py
+alwaysApply: false
+---
+
+# Toka: поиск organizations / stores
+
+Эндпоинты `GET /api/search/organizations` и `GET /api/search/stores` **намеренно** реализуют упрощённый поиск (см. docstring: «Stub search»). Поле `query` может игнорироваться — это ожидаемо для текущего MVP.
+
+- Не заменять заглушки на полноценный поиск без явного запроса в задаче.
+- При расширении API сохраняй форму ответа, если её уже потребляет фронт или граф диалога.

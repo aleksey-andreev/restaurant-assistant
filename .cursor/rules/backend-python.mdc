@@ -1,0 +1,17 @@
+---
+description: Соглашения по Python backend (FastAPI, async, хранилище)
+globs: backend/**/*.py
+alwaysApply: false
+---
+
+# Backend
+
+- Роутеры: `backend/app/routers/`, приложение собирается в `backend/app/main.py`.
+- Предпочитать **async** для I/O (httpx async, вызовы к БД через существующие async-абстракции).
+- Pydantic v2 (`model_validate`, `model_dump` и т.д. — как в проекте).
+- Ошибки внешних API: переводить в осмысленные HTTP-ответы там, где уже принято в роутере (например 502 от Toka), не глотать исключения без логирования/ответа.
+- Перед изменением поведения **Toka**: прочитать `backend/app/services/toka_client.py` и правила проекта про заглушки поиска в `restaurants.py`.
+
+```python
+# Зависимости FastAPI — через Annotated + Depends, как в существующих роутерах
+```

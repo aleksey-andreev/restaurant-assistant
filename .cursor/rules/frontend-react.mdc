@@ -1,0 +1,15 @@
+---
+description: Соглашения по React frontend (Vite, TypeScript)
+globs: frontend/src/**/*.{ts,tsx}
+alwaysApply: false
+---
+
+# Frontend
+
+- Точка входа: `frontend/src/main.tsx`, корневой UI — `frontend/src/ui/`. Стили: `frontend/src/styles.css` и существующие классы — сохранять визуальную согласованность.
+- Компоненты функциональные, React 18. API к backend — через существующие паттерны fetch/base URL в проекте, не хардкодить URL без необходимости.
+- TypeScript: строгие типы для публичных пропсов и данных с API; не раздувать `any`.
+
+```tsx
+// Новый UI — в духе текущих компонентов (Chat, App), без лишних зависимостей
+```

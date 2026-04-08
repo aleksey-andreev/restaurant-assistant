@@ -1,0 +1,31 @@
+---
+description: Продукт, архитектура и границы MVP — применять всегда
+alwaysApply: true
+---
+
+# Restaurant Assistant
+
+Помощник по выбору ресторана, бронированию столика и предзаказу: диалог на LLM + настраиваемый граф шагов (LangGraph), REST API, React SPA.
+
+## Стек
+
+- Backend: Python 3, FastAPI, LangGraph/LangChain, SQLAlchemy 2 + asyncpg, PostgreSQL для сессий и состояния графа, httpx, Toka (Evotor Horeca) Backoffice API, LLM через OpenAI-совместимый API (Cloud.ru Foundation Models).
+- Frontend: React 18, TypeScript, Vite, mobile-first.
+
+## Запуск (локально)
+
+- Backend: из корня репозитория `python3 backend/run.py` (или `cd backend && python3 run.py`). Переменные — из `.env` в корне проекта.
+- Frontend: `cd frontend && npm run dev`.
+
+## Намеренные упрощения (не «баги»)
+
+- Поиск организаций/магазинов через Toka в `backend/app/routers/restaurants.py` сейчас **заглушки** (игнорируют `query`, возвращают ограниченный набор). Не удалять и не «чинить» полнотекстовый поиск без явной задачи пользователя — см. docstring эндпоинтов.
+- `GraphRunner` в `backend/app/services/graph_runner.py` описан как упрощённый/placeholder там, где это указано в модуле — не считать это автоматически ошибкой.
+
+## Конфигурация графа
+
+- Узлы и сценарии: `backend/config/nodes.yaml` и связанный код раннера. Менять поведение диалога осмысленно только согласованно с этой конфигурацией.
+
+## Стиль изменений
+
+- Минимальный дифф под задачу; не рефакторить несвязанный код. Не добавлять markdown-доки в репозиторий без запроса.
