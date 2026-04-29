@@ -1,3 +1,36 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap");
+
+:root {
+  --font-base: "Afisha Sans", "Graphik", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --bg-page: #f5f5f2;
+  --bg-panel: #ffffff;
+  --bg-subtle: #f1f1ed;
+  --bg-soft-accent: #fff2e6;
+  --text-primary: #141414;
+  --text-secondary: #4f4f4f;
+  --text-muted: #7a7a72;
+  --border-default: #e2e1db;
+  --border-strong: #cfcbbf;
+  --brand-primary: #ff4f12;
+  --brand-primary-hover: #e5450d;
+  --brand-contrast: #ffffff;
+  --focus-ring: #ff7f4d;
+  --success-bg: #eaf9ef;
+  --success-border: #9fd6b0;
+  --success-text: #1c6a38;
+  --error-bg: #fff0ee;
+  --error-border: #ffb4ad;
+  --error-text: #a52b1f;
+  --shadow-sm: 0 6px 18px rgba(16, 24, 40, 0.06);
+  --shadow-md: 0 14px 36px rgba(16, 24, 40, 0.09);
+  --radius-lg: 22px;
+  --radius-md: 16px;
+  --radius-sm: 12px;
+  --radius-pill: 999px;
+  --header-sticky-offset: 5.2rem;
+  --toolbar-gap-from-header: 0.7rem;
+}
+
 *,
 *::before,
 *::after {
@@ -6,9 +39,9 @@
 
 body {
   margin: 0;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #050816;
-  color: #f9fafb;
+  font-family: var(--font-base);
+  background: radial-gradient(circle at 20% 0%, #fffaf6, #f5f5f2 45%);
+  color: var(--text-primary);
 }
 
 .app-root {
@@ -18,76 +51,120 @@ body {
 }
 
 .app-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  backdrop-filter: blur(8px);
+  background: color-mix(in srgb, var(--bg-page) 86%, #ffffff 14%);
+  border-bottom: 1px solid var(--border-default);
   padding: 1.25rem 1rem;
-  background: radial-gradient(circle at top left, #1e293b, #020617);
-  border-bottom: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.app-header-inner {
+  margin: 0 auto;
+  max-width: 740px;
 }
 
 .app-header h1 {
-  margin: 0 0 0.25rem;
-  font-size: 1.4rem;
+  margin: 0;
+  font-size: clamp(1.45rem, 4vw, 1.95rem);
+  letter-spacing: -0.02em;
+  font-weight: 800;
+  color: var(--text-primary);
 }
 
 .app-header p {
-  margin: 0;
-  font-size: 0.9rem;
-  color: #e5e7eb;
+  margin: 0.28rem 0 0;
+  font-size: 0.95rem;
+  color: var(--text-secondary);
 }
 
 .app-main {
   flex: 1;
   display: flex;
-  padding: 0.75rem;
+  padding: 0.85rem;
 }
 
 .chat-root {
   margin: 0 auto;
   width: 100%;
-  max-width: 640px;
-  background: rgba(15, 23, 42, 0.9);
-  border-radius: 1rem;
-  padding: 0.75rem;
+  max-width: 740px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  padding: 0.9rem;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.8);
+  gap: 0.7rem;
+  box-shadow: var(--shadow-md);
+  min-height: calc(100vh - 11.5rem);
+  padding-bottom: 0.9rem;
 }
 
 .chat-toolbar {
   display: flex;
-  justify-content: flex-end;
+  justify-content: flex-start;
+  position: sticky;
+  top: calc(var(--header-sticky-offset) + var(--toolbar-gap-from-header));
+  z-index: 9;
+  margin-bottom: 0.15rem;
 }
 
 .chat-new-thread {
-  border: 1px solid rgba(148, 163, 184, 0.5);
-  border-radius: 999px;
-  padding: 0.35rem 0.75rem;
-  font-size: 0.8rem;
-  font-weight: 500;
-  background: transparent;
-  color: #e5e7eb;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  border: 1px solid #f0eee7;
+  border-radius: var(--radius-pill);
+  padding: 0.58rem 1rem;
+  background: #ffffff;
+  color: #1a1a17;
   cursor: pointer;
+  box-shadow: 0 8px 16px rgba(18, 24, 40, 0.08);
+  transition: box-shadow 120ms ease, transform 120ms ease;
+  font-size: 0.92rem;
+  font-weight: 500;
 }
 
 .chat-new-thread:hover:not(:disabled) {
-  border-color: rgba(129, 140, 248, 0.8);
-  color: #c7d2fe;
+  box-shadow: 0 10px 18px rgba(18, 24, 40, 0.12);
+  transform: translateY(-1px);
 }
 
 .chat-new-thread:disabled {
-  opacity: 0.55;
+  opacity: 0.6;
   cursor: default;
 }
 
+.chat-new-thread-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.2rem;
+  height: 1.2rem;
+  font-size: 1rem;
+  line-height: 1;
+}
+
 .chat-messages {
-  flex: 1;
-  min-height: 240px;
-  max-height: calc(100vh - 260px);
-  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  overflow: visible;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-  padding-right: 0.25rem;
+  gap: 0.65rem;
+  padding-right: 0;
+}
+
+.chat-error {
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--error-border);
+  background: var(--error-bg);
+  color: var(--error-text);
+  padding: 0.65rem 0.75rem;
+  font-size: 0.86rem;
+  line-height: 1.35;
 }
 
 .chat-message {
@@ -103,83 +180,185 @@ body {
 }
 
 .chat-bubble {
-  max-width: 80%;
-  padding: 0.6rem 0.8rem;
-  border-radius: 0.9rem;
-  font-size: 0.9rem;
-  line-height: 1.4;
+  max-width: 85%;
+  padding: 0.72rem 0.9rem;
+  border-radius: var(--radius-md);
+  font-size: 0.93rem;
+  line-height: 1.45;
 }
 
 .chat-message-user .chat-bubble {
-  background: linear-gradient(to bottom right, #4f46e5, #22c55e);
-  color: #f9fafb;
-  border-bottom-right-radius: 0.1rem;
+  background: var(--brand-primary);
+  color: var(--brand-contrast);
+  border-bottom-right-radius: 6px;
 }
 
 .chat-message-assistant .chat-bubble {
-  background: #020617;
-  color: #e5e7eb;
-  border-bottom-left-radius: 0.1rem;
-  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  border-bottom-left-radius: 6px;
+  white-space: pre-wrap;
 }
 
 .chat-bubble-loading {
-  opacity: 0.9;
   font-style: italic;
+  color: var(--text-muted);
 }
 
 .chat-input-row {
   display: flex;
-  gap: 0.5rem;
-  align-items: flex-end;
-  margin-top: 0.25rem;
+  gap: 0.55rem;
+  align-items: center;
+  margin-top: auto;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .chat-input {
   flex: 1;
   resize: none;
-  border-radius: 0.75rem;
-  border: 1px solid rgba(148, 163, 184, 0.5);
-  padding: 0.5rem 0.7rem;
-  background: rgba(15, 23, 42, 0.9);
-  color: #e5e7eb;
-  font-size: 0.9rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  padding: 0.65rem 0.75rem;
+  background: #ffffff;
+  color: var(--text-primary);
+  font-size: 0.92rem;
+  font-weight: 500;
+  font-family: inherit;
+  box-shadow: var(--shadow-sm);
+}
+
+.chat-input::placeholder {
+  color: #8c8c86;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  font-style: normal;
+  opacity: 1;
+}
+
+.restaurant-card-link:focus-visible,
+.chat-send:focus-visible,
+.chat-new-thread:focus-visible,
+.restaurant-card-select:focus-visible,
+.search-plan-confirm:focus-visible,
+.booking-form-submit:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .chat-input:focus-visible {
-  outline: 2px solid #4f46e5;
-  outline-offset: 1px;
+  outline: none;
+  border-color: var(--border-strong);
+}
+
+.booking-field input:focus-visible {
+  outline: none;
+  border-color: var(--border-strong);
 }
 
 .chat-send {
   border: none;
-  border-radius: 999px;
-  padding: 0.55rem 0.9rem;
-  font-size: 0.9rem;
-  font-weight: 500;
-  background: linear-gradient(to right, #4f46e5, #22c55e);
-  color: #f9fafb;
+  border-radius: 50%;
+  width: 2.6rem;
+  height: 2.6rem;
+  min-width: 2.6rem;
+  padding: 0;
+  font-size: 1rem;
+  font-weight: 700;
+  background: var(--brand-primary);
+  color: var(--brand-contrast);
   cursor: pointer;
-  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 120ms ease, transform 120ms ease;
 }
 
-.chat-send:disabled {
-  opacity: 0.6;
+.chat-send-icon {
+  transform: translateX(1px);
+}
+
+.chat-send:hover:not(:disabled),
+.restaurant-card-select:hover:not(:disabled),
+.search-plan-confirm:hover:not(:disabled),
+.booking-form-submit:hover:not(:disabled) {
+  background: var(--brand-primary-hover);
+}
+
+.chat-send:active:not(:disabled),
+.restaurant-card-select:active:not(:disabled),
+.search-plan-confirm:active:not(:disabled),
+.booking-form-submit:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.chat-send:disabled,
+.restaurant-card-select:disabled,
+.search-plan-confirm:disabled,
+.booking-form-submit:disabled {
+  opacity: 0.58;
   cursor: default;
 }
 
 .dialog-extras {
-  margin-top: 0.5rem;
-  padding: 0.75rem 0.25rem 0;
-  border-top: 1px solid rgba(148, 163, 184, 0.25);
+  margin-top: 0.2rem;
+  padding: 0.85rem 0.25rem 0;
+  border-top: 1px solid var(--border-default);
 }
 
 .dialog-extras-heading {
   font-size: 0.75rem;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: #94a3b8;
-  margin-bottom: 0.5rem;
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
+  margin-bottom: 0.52rem;
+  font-weight: 700;
+}
+
+.search-plan-panel {
+  margin-bottom: 0.95rem;
+  padding: 0.82rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-soft-accent);
+  border: 1px solid #ffd8bf;
+}
+
+.search-plan-panel-title {
+  font-size: 0.86rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 0.3rem;
+}
+
+.search-plan-panel-text {
+  margin: 0 0 0.68rem;
+  font-size: 0.84rem;
+  line-height: 1.42;
+  color: var(--text-secondary);
+}
+
+.search-plan-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.search-plan-confirm,
+.restaurant-card-select,
+.booking-form-submit {
+  border: none;
+  background: var(--brand-primary);
+  color: var(--brand-contrast);
+  border-radius: var(--radius-pill);
+  padding: 0.47rem 0.9rem;
+  font-size: 0.84rem;
+  font-weight: 700;
+  cursor: pointer;
 }
 
 .restaurant-card-list {
@@ -188,7 +367,7 @@ body {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
+  gap: 0.68rem;
 }
 
 .restaurant-card-wrap {
@@ -196,165 +375,219 @@ body {
 }
 
 .restaurant-card {
-  background: rgba(2, 6, 23, 0.95);
-  border: 1px solid rgba(148, 163, 184, 0.35);
-  border-radius: 0.85rem;
-  padding: 0.65rem 0.75rem;
+  background: #ffffff;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 0.75rem 0.8rem;
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
+  gap: 0.45rem;
+  box-shadow: var(--shadow-sm);
+  font-size: 0.92rem;
+  font-weight: 500;
+  font-family: inherit;
 }
 
 .restaurant-card--active {
-  border-color: rgba(129, 140, 248, 0.75);
-  box-shadow: 0 0 0 1px rgba(129, 140, 248, 0.35);
+  border-color: #ffbe9d;
+  box-shadow: 0 0 0 2px #ffd7c5;
 }
 
 .restaurant-card-top {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 0.5rem;
+  gap: 0.55rem;
 }
 
 .restaurant-card-title {
   margin: 0;
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: #f1f5f9;
-  line-height: 1.25;
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.3;
 }
 
 .restaurant-card-score {
   flex-shrink: 0;
-  font-size: 0.75rem;
-  font-weight: 600;
-  color: #a5b4fc;
-  background: rgba(79, 70, 229, 0.2);
-  padding: 0.15rem 0.45rem;
-  border-radius: 999px;
+  font-size: 0.92rem;
+  font-weight: 500;
+  color: #8f340e;
+  background: #ffe5d8;
+  padding: 0.18rem 0.48rem;
+  border-radius: var(--radius-pill);
 }
 
 .restaurant-card-why {
   margin: 0;
   padding-left: 1rem;
-  font-size: 0.8rem;
-  color: #cbd5e1;
-  line-height: 1.35;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  line-height: 1.38;
+}
+
+.restaurant-card-facts {
+  margin: 0;
+  padding-left: 1rem;
+  font-size: 0.92rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.restaurant-card-facts li + li {
+  margin-top: 0.08rem;
+}
+
+.restaurant-card-fact-label {
+  color: var(--text-primary);
+  font-weight: 500;
 }
 
 .restaurant-card-link {
-  font-size: 0.82rem;
-  color: #93c5fd;
+  width: fit-content;
+  font-size: 0.92rem;
+  font-weight: 500;
+  color: #b23b11;
   text-decoration: none;
-  word-break: break-all;
+  border-bottom: 1px dashed currentColor;
 }
 
 .restaurant-card-link:hover {
-  text-decoration: underline;
+  color: #962f0b;
+}
+
+.restaurant-card-toka-hint {
+  margin: 0.35rem 0 0;
+  font-size: 0.92rem;
+  font-weight: 500;
+  line-height: 1.35;
+  color: var(--text-muted);
 }
 
 .restaurant-card-select {
   align-self: flex-start;
   margin-top: 0.25rem;
-  border: 1px solid rgba(129, 140, 248, 0.55);
-  background: rgba(79, 70, 229, 0.15);
-  color: #e0e7ff;
-  border-radius: 999px;
-  padding: 0.35rem 0.75rem;
-  font-size: 0.8rem;
-  font-weight: 500;
-  cursor: pointer;
-}
-
-.restaurant-card-select:hover:not(:disabled) {
-  background: rgba(79, 70, 229, 0.3);
-}
-
-.restaurant-card-select:disabled {
-  opacity: 0.75;
-  cursor: default;
 }
 
 .dialog-extras-errors {
   margin-top: 0.5rem;
-  padding: 0.5rem 0.65rem;
-  border-radius: 0.5rem;
-  background: rgba(127, 29, 29, 0.35);
-  border: 1px solid rgba(248, 113, 113, 0.45);
+  padding: 0.58rem 0.68rem;
+  border-radius: var(--radius-sm);
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
   font-size: 0.82rem;
-  color: #fecaca;
+  color: var(--error-text);
 }
 
 .booking-form {
-  margin-top: 0.85rem;
-  padding: 0.75rem;
-  border-radius: 0.85rem;
-  background: rgba(15, 23, 42, 0.65);
-  border: 1px solid rgba(148, 163, 184, 0.3);
+  margin-top: 0.9rem;
+  padding: 0.82rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
   display: flex;
   flex-direction: column;
-  gap: 0.55rem;
+  gap: 0.58rem;
+  font-size: 0.92rem;
+  font-weight: 500;
+  font-family: inherit;
 }
 
 .booking-form-title {
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: #e2e8f0;
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: var(--text-primary);
 }
 
 .booking-form-hint {
   margin: 0;
-  font-size: 0.78rem;
-  color: #94a3b8;
+  font-size: 0.92rem;
+  font-weight: 500;
+  color: var(--text-muted);
 }
 
 .booking-field {
   display: flex;
   flex-direction: column;
-  gap: 0.2rem;
-  font-size: 0.78rem;
-  color: #cbd5e1;
+  gap: 0.22rem;
+  font-size: 0.92rem;
+  font-weight: 500;
+  color: var(--text-secondary);
 }
 
 .booking-field input {
-  border-radius: 0.5rem;
-  border: 1px solid rgba(148, 163, 184, 0.45);
-  padding: 0.4rem 0.5rem;
-  background: rgba(2, 6, 23, 0.85);
-  color: #f1f5f9;
-  font-size: 0.88rem;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  padding: 0.46rem 0.55rem;
+  background: #ffffff;
+  color: var(--text-primary);
+  font-size: 0.92rem;
+  font-weight: 500;
+  font-family: inherit;
 }
 
-.booking-field input:focus-visible {
-  outline: 2px solid #6366f1;
-  outline-offset: 1px;
+.booking-confirmation {
+  margin-top: 0.92rem;
+  padding: 0.82rem;
+  border-radius: var(--radius-md);
+  background: var(--success-bg);
+  border: 1px solid var(--success-border);
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  font-size: 0.92rem;
+  font-weight: 500;
+  font-family: inherit;
 }
 
-.booking-form-submit {
-  margin-top: 0.25rem;
-  border: none;
-  border-radius: 999px;
-  padding: 0.5rem 0.9rem;
-  font-size: 0.85rem;
-  font-weight: 600;
-  background: linear-gradient(to right, #4f46e5, #059669);
-  color: #f9fafb;
-  cursor: pointer;
+.booking-confirmation-title {
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: var(--success-text);
 }
 
-.booking-form-submit:disabled {
-  opacity: 0.55;
-  cursor: default;
+.booking-confirmation-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.6rem;
+  font-size: 0.92rem;
+  font-weight: 500;
+  color: #296d3b;
+}
+
+.booking-confirmation-row strong {
+  color: #125327;
+  text-align: right;
+  font-weight: 500;
 }
 
 @media (min-width: 768px) {
+  :root {
+    --header-sticky-offset: 5.9rem;
+    --toolbar-gap-from-header: 0.8rem;
+  }
+
   .app-header {
-    padding: 1.5rem 2rem;
+    padding: 1.4rem 1.8rem;
   }
 
   .app-main {
-    padding: 1.5rem;
+    padding: 1.4rem;
+  }
+
+  .chat-root {
+    padding: 1.1rem;
+    min-height: calc(100vh - 12.5rem);
+  }
+
+  .chat-messages {
+    max-height: none;
+  }
+
+  .chat-input-row {
+    margin-top: auto;
   }
 }
 

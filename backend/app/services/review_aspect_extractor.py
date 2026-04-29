@@ -32,7 +32,6 @@ async def extract_aspects_from_reviews(
     node_params: Dict[str, Any],
     *,
     reviews: List[str],
-    occasion: str,
     restaurant_name: Optional[str] = None,
     max_chars: int = 12000,
 ) -> Dict[str, Any]:
@@ -59,7 +58,7 @@ async def extract_aspects_from_reviews(
 
     reviews_text = "\n\n".join(joined).strip()
     if not reviews_text:
-        return {"aspects": _scores_default(), "evidence_count": 0, "occasion": occasion}
+        return {"aspects": _scores_default(), "evidence_count": 0}
 
     sys = (
         "Ты извлекаешь факты из отзывов посетителей ресторана. "
@@ -68,7 +67,6 @@ async def extract_aspects_from_reviews(
     )
     user = {
         "restaurant_name": restaurant_name,
-        "occasion": occasion,
         "reviews_text": reviews_text,
         "task": (
             "Оцени по отзывам следующие аспекты по шкале 0..1: "
@@ -88,7 +86,6 @@ async def extract_aspects_from_reviews(
                 "value": {"score": 0.0, "evidence": None},
             },
             "evidence_count": 0,
-            "occasion": "string",
         },
     }
 
@@ -104,13 +101,12 @@ async def extract_aspects_from_reviews(
         parsed = json.loads(json_text)
     except Exception as exc:
         # last resort: return defaults
-        return {"aspects": _scores_default(), "evidence_count": 0, "occasion": occasion, "error": str(exc)}
+        return {"aspects": _scores_default(), "evidence_count": 0, "error": str(exc)}
 
     # normalize missing keys
     aspects = parsed.get("aspects") or _scores_default()
     return {
         "aspects": aspects,
         "evidence_count": parsed.get("evidence_count", None) or 0,
-        "occasion": occasion,
     }
 

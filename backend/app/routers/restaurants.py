@@ -5,29 +5,33 @@ from typing import Annotated, Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from ..services.toka_client import (
-    TokaBackofficeClient,
-    TokaClientError,
-    find_table_capacity,
-    get_toka_backoffice_client,
-)
+from ..services.toka_gateway import TokaGateway, TokaGatewayError, get_toka_gateway
 
 router = APIRouter(tags=["restaurants"])
 
 
-async def get_toka_client_dep() -> TokaBackofficeClient:
+def _raise_toka_gateway_http(exc: TokaGatewayError) -> None:
+    code = getattr(exc, "code", "")
+    if code == "NO_TABLE_AVAILABLE":
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if code == "TABLE_NOT_FOUND":
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+async def get_toka_gateway_dep() -> TokaGateway:
     try:
-        return await get_toka_backoffice_client()
-    except TokaClientError as exc:
+        return await get_toka_gateway()
+    except TokaGatewayError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-TokaClientDep = Annotated[TokaBackofficeClient, Depends(get_toka_client_dep)]
+TokaGatewayDep = Annotated[TokaGateway, Depends(get_toka_gateway_dep)]
 
 
 @router.get("/search/organizations")
 async def search_organizations(
-    client: TokaClientDep,
+    gateway: TokaGatewayDep,
     query: str = "",
 ) -> Dict[str, Any]:
     """
@@ -35,10 +39,9 @@ async def search_organizations(
     """
     _ = query
     try:
-        data = await client.get_my_organizations()
-    except TokaClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    items = list(data.get("items") or [])
+        items = await gateway.list_organizations()
+    except TokaGatewayError as exc:
+        _raise_toka_gateway_http(exc)
     if not items:
         return {
             "items": [],
@@ -58,7 +61,7 @@ async def search_organizations(
 
 @router.get("/search/stores")
 async def search_stores(
-    client: TokaClientDep,
+    gateway: TokaGatewayDep,
     organization_id: str,
     query: str = "",
 ) -> Dict[str, Any]:
@@ -67,10 +70,9 @@ async def search_stores(
     """
     _ = query
     try:
-        data = await client.list_stores(organization_id)
-    except TokaClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    items = list(data.get("items") or [])
+        items = await gateway.list_stores(organization_id)
+    except TokaGatewayError as exc:
+        _raise_toka_gateway_http(exc)
     if not items:
         return {
             "items": [],
@@ -97,14 +99,14 @@ async def search_stores(
 
 @router.get("/stores/{store_id}/halls-tables")
 async def halls_and_tables(
-    client: TokaClientDep,
+    gateway: TokaGatewayDep,
     store_id: str,
     organization_id: str,
 ) -> Dict[str, Any]:
     try:
-        return await client.get_halls_and_tables(organization_id, store_id)
-    except TokaClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return await gateway.get_halls_and_tables(organization_id, store_id)
+    except TokaGatewayError as exc:
+        _raise_toka_gateway_http(exc)
 
 
 class CreateReservationRequest(BaseModel):
@@ -120,33 +122,24 @@ class CreateReservationRequest(BaseModel):
 
 @router.post("/stores/{store_id}/reservations")
 async def create_reservation(
-    client: TokaClientDep,
+    gateway: TokaGatewayDep,
     store_id: str,
     organization_id: str,
     payload: CreateReservationRequest,
 ) -> Dict[str, Any]:
     try:
-        halls = await client.get_halls_and_tables(organization_id, store_id)
-    except TokaClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    cap = find_table_capacity(halls, payload.table_id)
-    if cap is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Table {payload.table_id} not found in this store",
+        result = await gateway.create_reservation(
+            restaurant_ref={},
+            starts_at=payload.starts_at,
+            guest_count=payload.guest_count,
+            guest_name=payload.guest_name,
+            guest_phone=payload.guest_phone,
+            duration_minutes=payload.duration_minutes,
+            notes=payload.notes,
+            table_id=payload.table_id,
+            organization_id=organization_id,
+            store_id=store_id,
         )
-    if payload.guest_count > cap:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"guest_count ({payload.guest_count}) exceeds table capacity ({cap}). "
-                "Choose a larger table or reduce party size."
-            ),
-        )
-
-    body = payload.model_dump()
-    try:
-        return await client.create_reservation(organization_id, store_id, body)
-    except TokaClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return dict(result.get("raw") or result)
+    except TokaGatewayError as exc:
+        _raise_toka_gateway_http(exc)

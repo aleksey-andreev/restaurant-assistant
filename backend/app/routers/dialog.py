@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from fastapi import APIRouter, Cookie, Depends, Query, Response
 from pydantic import BaseModel, Field
@@ -19,9 +19,27 @@ class SelectBookingCandidateAction(BaseModel):
     index: int = Field(ge=0, description="0-based index in final_recommendations / recommendations / shortlist")
 
 
+class SubmitBookingAction(BaseModel):
+    type: Literal["submit_booking"] = "submit_booking"
+    starts_at: str = Field(..., min_length=1, description="ISO-8601 datetime from the booking form")
+    guest_count: int = Field(..., ge=1)
+    guest_name: str = Field(..., min_length=1)
+    guest_phone: str = Field(..., min_length=1)
+
+
+class ConfirmSearchPlanAction(BaseModel):
+    type: Literal["confirm_search_plan"] = "confirm_search_plan"
+
+
+DialogClientAction = Annotated[
+    Union[SelectBookingCandidateAction, SubmitBookingAction, ConfirmSearchPlanAction],
+    Field(discriminator="type"),
+]
+
+
 class DialogRequest(BaseModel):
     messages: List[Message]
-    client_action: Optional[SelectBookingCandidateAction] = None
+    client_action: Optional[DialogClientAction] = None
 
 
 class DialogResponse(BaseModel):

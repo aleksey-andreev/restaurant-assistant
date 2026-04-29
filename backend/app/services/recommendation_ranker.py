@@ -106,32 +106,6 @@ def _cuisine_score(cand_tags: List[str], wanted: List[str], avoided: List[str]) 
     return 1.0
 
 
-def _occasion_score(requirements: Dict[str, Any], cand: Dict[str, Any]) -> float:
-    occasion = (requirements.get("occasion") or "").strip().lower()
-    flags: Dict[str, Optional[bool]] = cand.get("flags") or {}
-
-    # Keep "romantic" and similar as soft signals: only use what's available as structure.
-    if occasion in {"birthday", "день рождения"}:
-        # For birthday, банкет/кейтеринг usually correlates with readiness.
-        return 0.6 * (1.0 if flags.get("banquets") else 0.0) + 0.4 * (1.0 if flags.get("catering") else 0.0)
-    if occasion in {"anniversary", "юбилей"}:
-        return 0.5 * (1.0 if flags.get("banquets") else 0.0) + 0.5 * (1.0 if flags.get("catering") else 0.0)
-    if occasion in {"romantic", "романтическая встреча", "романтический"}:
-        # We don't have "quiet/cozy" structured fields from Afisha reliably,
-        # so use only presence of delivery/parking/etc. as weak proxies.
-        s = 0.0
-        if flags.get("parking") is True:
-            s += 0.15
-        if flags.get("delivery") is True:
-            s += 0.1
-        # banquets/catering are neutral but can imply "appropriate for date group"
-        if flags.get("banquets") is True:
-            s += 0.1
-        return min(0.5, s)
-
-    return 0.0
-
-
 @dataclass
 class RankedCandidate:
     candidate: Dict[str, Any]
@@ -215,17 +189,11 @@ def rank_candidates(
                 reasons.append("Cuisine/tags match")
 
         occ_score: Optional[float] = None
-        occasion = str(requirements.get("occasion") or "").strip().lower()
-        if occasion:
-            occ_score = _occasion_score(requirements, cand)
-            if occ_score and occ_score > 0:
-                reasons.append("Occasion fit (banquets/catering/availability)")
 
-        # Assemble weighted total using only known components
+        # Assemble weighted total using only known components (occasion excluded from search/rank).
         components: List[Tuple[str, float, Optional[float]]] = [
-            ("budget", 0.40, budget_score),
-            ("cuisine", 0.35, cuisine_score),
-            ("occasion", 0.20, occ_score),
+            ("budget", 0.53, budget_score),
+            ("cuisine", 0.47, cuisine_score),
         ]
         known = [c for c in components if c[2] is not None]
         if hard_pass:
@@ -300,4 +268,30 @@ def rank_candidates(
         "above_threshold_count": above_threshold_count,
         "top_candidates_sorted": above_sorted[:10],
     }
+
+
+def recalc_formal_thresholds(
+    scored_candidates: List[Dict[str, Any]],
+    *,
+    min_score_floor: float = 0.35,
+) -> Tuple[float, int]:
+    """
+    Same percentile rule as rank_candidates, but on dicts with formal_score already set.
+    Use after post-processing formal_score (e.g. Toka unverified penalty).
+    """
+    non_hard = [c for c in scored_candidates if not c.get("hard_pass")]
+    if not non_hard:
+        return 1.0, 0
+    sorted_scores = sorted(float(c.get("formal_score") or 0.0) for c in non_hard)
+    idx = int(math.floor(len(sorted_scores) * 0.6))
+    idx = min(max(idx, 0), len(sorted_scores) - 1)
+    min_score = max(min_score_floor, sorted_scores[idx])
+    above_n = len(
+        [
+            c
+            for c in non_hard
+            if float(c.get("formal_score") or 0) >= min_score and float(c.get("formal_score") or 0) > 0
+        ]
+    )
+    return float(min_score), above_n
 

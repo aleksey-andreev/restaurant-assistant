@@ -62,6 +62,42 @@ def _extract_avg_check(full_text: str) -> Optional[Dict[str, Any]]:
     return {"raw": raw, "min": min_v, "max": max_v}
 
 
+# Permanent / long-term closure and "closed now" markers on Afisha cards.
+# Word edges: avoid matching "закрыто" inside "закрытое (меню)" etc.
+_RE_AFISHA_VENUE_CLOSED_STRONG = re.compile(
+    r"(ресторан|кафе|бар|место|заведение)\s+закрыт[аы]?(?![А-Яа-яЁёa-z])"
+    r"|закрыт[аыо]?\s+навсегда"
+    r"|временно\s+закрыт[аыо]?(?![А-Яа-яЁёa-z])"
+    r"|больше\s+не\s+работает",
+    re.IGNORECASE | re.UNICODE,
+)
+
+_RE_AFISHA_CLOSED_NEUTER_WORD = re.compile(
+    r"(?<![А-Яа-яЁёa-zA-Z0-9])закрыто(?![А-Яа-яЁёa-zA-Z])",
+    re.IGNORECASE,
+)
+
+# Masculine "закрыт" as a whole word — e.g. "Ресторан Plum закрыт" (name between label and word).
+_RE_AFISHA_CLOSED_MASC_WORD = re.compile(
+    r"(?<![А-Яа-яЁёa-zA-Z0-9])закрыт(?![А-Яа-яЁёa-zA-Z])",
+    re.IGNORECASE,
+)
+
+
+def _venue_marked_closed(full_text: str) -> bool:
+    """True if the card text indicates the venue is closed (incl. permanent closure)."""
+    t = _norm_space(full_text)
+    if not t:
+        return False
+    if _RE_AFISHA_VENUE_CLOSED_STRONG.search(t):
+        return True
+    if _RE_AFISHA_CLOSED_NEUTER_WORD.search(t):
+        return True
+    if _RE_AFISHA_CLOSED_MASC_WORD.search(t):
+        return True
+    return False
+
+
 def _extract_open_now(full_text: str) -> Dict[str, Any]:
     # Examples from Afisha:
     # "Открыто c 12:00 до 00:00"
@@ -72,8 +108,7 @@ def _extract_open_now(full_text: str) -> Dict[str, Any]:
     m2 = re.search(r"Открыто\s+до\s+(\d{1,2}:\d{2})", full_text)
     if m2:
         return {"is_open_now": True, "raw": _norm_space(m2.group(0)), "to": m2.group(1)}
-    # If card doesn't say "Открыто", treat as unknown (not closed)
-    if "Закрыто" in full_text:
+    if _venue_marked_closed(full_text):
         return {"is_open_now": False, "raw": "Закрыто"}
     return {"is_open_now": None, "raw": None}
 
@@ -173,19 +208,22 @@ def parse_afisha_restaurant_card(html: str, url: str) -> Dict[str, Any]:
     ld = _extract_ld_restaurant(html)
 
     name = None
-    h1 = soup.find("h1")
-    if h1:
-        name = _norm_space(h1.get_text(" ", strip=True))
-    if not name and ld and ld.get("name"):
+    if ld and ld.get("name"):
         name = _norm_space(str(ld["name"]))
+    if not name:
+        h1 = soup.find("h1")
+        if h1:
+            name = _norm_space(h1.get_text(" ", strip=True))
 
-    avg_check = _extract_avg_check(full_text)
-    if not avg_check and ld and ld.get("priceRange"):
+    avg_check = None
+    if ld and ld.get("priceRange"):
         pr = str(ld["priceRange"])
         parsed = _parse_price_range(pr.replace("₽", " ₽"))
         if parsed:
             min_v, max_v = parsed
             avg_check = {"raw": _norm_space(pr), "min": min_v, "max": max_v}
+    if not avg_check:
+        avg_check = _extract_avg_check(full_text)
 
     open_now = _extract_open_now(full_text)
     flags = _extract_flags(full_text)
@@ -200,18 +238,19 @@ def parse_afisha_restaurant_card(html: str, url: str) -> Dict[str, Any]:
     if extras:
         tags = merge_tag_lists(tags, extras)
 
-    # Address is hard to extract robustly, but in Afisha it usually appears near "Подробная информация".
     address = None
-    m_city = re.search(r"(Москва, [^О]+Посмотреть на карту)", full_text)
-    if m_city:
-        address = _norm_space(m_city.group(1).replace("Посмотреть на карту", "")).strip(" ,")
-    if not address and ld and isinstance(ld.get("address"), dict):
+    if ld and isinstance(ld.get("address"), dict):
         a = ld["address"]
         loc = a.get("addressLocality")
         street = a.get("streetAddress")
         parts = [p for p in (loc, street) if isinstance(p, str) and p.strip()]
         if parts:
             address = _norm_space(", ".join(parts))
+    # Fallback for cards where JSON-LD address is absent/incomplete.
+    if not address:
+        m_city = re.search(r"(Москва, [^О]+Посмотреть на карту)", full_text)
+        if m_city:
+            address = _norm_space(m_city.group(1).replace("Посмотреть на карту", "")).strip(" ,")
 
     metro = None
     m_metro = re.search(r"\b([А-ЯA-Z][а-яa-z\- ]{2,30})\b\s*Посмотреть на карту", full_text)
@@ -224,6 +263,8 @@ def parse_afisha_restaurant_card(html: str, url: str) -> Dict[str, Any]:
         elif isinstance(sa, str) and sa.strip():
             metro = _norm_space(sa)
 
+    venue_closed = _venue_marked_closed(full_text)
+
     return {
         "url": url,
         "name": name,
@@ -231,6 +272,7 @@ def parse_afisha_restaurant_card(html: str, url: str) -> Dict[str, Any]:
         "metro": metro,
         "avg_check": avg_check,
         "open_now": open_now,
+        "venue_closed": venue_closed,
         "flags": flags,
         "tags": tags,
         # raw text is useful for debug/LLM but keep it out of scoring by default

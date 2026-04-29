@@ -7,8 +7,10 @@ export const App: React.FC = () => {
   return (
     <div className="app-root">
       <header className="app-header">
-        <h1>Restaurant Assistant</h1>
-        <p>Подбор ресторана, бронь и предзаказ с помощью ИИ</p>
+        <div className="app-header-inner">
+          <h1>Reserved</h1>
+          <p>Подбор ресторана, бронь и предзаказ с помощью ИИ</p>
+        </div>
       </header>
       <main className="app-main">
         <Chat sessionId={sessionId} onSessionChange={setSessionId} />

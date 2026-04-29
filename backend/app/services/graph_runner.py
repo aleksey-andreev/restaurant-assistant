@@ -14,6 +14,107 @@ from ..storage.session_store import SessionStore
 from ..storage.state_repository import StateRepository
 
 
+def fingerprint_search_plan(req: Dict[str, Any]) -> str:
+    """Stable fingerprint for search-relevant requirement fields (confirm / invalidate)."""
+    city = (req.get("city") or "").strip().lower() if isinstance(req.get("city"), str) else ""
+    ps = req.get("party_size")
+    party: Optional[int] = None
+    if isinstance(ps, (int, float)) and not isinstance(ps, bool) and int(ps) >= 1:
+        party = int(ps)
+    br = req.get("budget_range") or {}
+    mn = mx = None
+    if isinstance(br, dict):
+        try:
+            mn = float(br.get("min"))
+            mx = float(br.get("max"))
+        except (TypeError, ValueError):
+            pass
+    loc = req.get("location")
+    loc_key: Any = None
+    if isinstance(loc, dict):
+        loc_key = (loc.get("type"), loc.get("value"))
+    cw = sorted(
+        str(x).strip().lower()
+        for x in (req.get("cuisine_wanted") or [])
+        if isinstance(x, str) and x.strip()
+    )
+    ca = sorted(
+        str(x).strip().lower()
+        for x in (req.get("cuisine_avoid") or [])
+        if isinstance(x, str) and x.strip()
+    )
+    payload = {
+        "city": city,
+        "party": party,
+        "budget": (mn, mx) if mn is not None and mx is not None else None,
+        "loc": loc_key,
+        "cw": cw,
+        "ca": ca,
+    }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+def format_search_plan_summary(req: Dict[str, Any]) -> str:
+    """Human-readable plan for user confirmation (no occasion; cuisine default)."""
+    city = req.get("city") if isinstance(req.get("city"), str) else ""
+    city = city.strip() or "—"
+    ps = req.get("party_size")
+    party_s = f"{int(ps)}" if isinstance(ps, (int, float)) and not isinstance(ps, bool) and int(ps) >= 1 else "—"
+
+    br = req.get("budget_range") or {}
+    mn = mx = None
+    if isinstance(br, dict):
+        try:
+            mn = float(br.get("min"))
+            mx = float(br.get("max"))
+        except (TypeError, ValueError):
+            pass
+    if mn is not None and mx is not None:
+        budget_s = f"от {_fmt_money(mn)} до {_fmt_money(mx)} ₽ на человека"
+    else:
+        budget_s = "—"
+
+    loc = req.get("location")
+    if isinstance(loc, dict) and loc.get("type") in {"metro", "area"}:
+        lv = loc.get("value")
+        if isinstance(lv, str) and lv.strip():
+            loc_s = f"{loc.get('type')}: {lv.strip()}"
+        else:
+            loc_s = "весь город (без привязки к метро/району)"
+    elif isinstance(loc, dict) and loc.get("type") == "none":
+        loc_s = "весь город (без привязки к метро/району)"
+    else:
+        loc_s = "—"
+
+    wanted = [str(x).strip() for x in (req.get("cuisine_wanted") or []) if isinstance(x, str) and str(x).strip()]
+    avoided = [str(x).strip() for x in (req.get("cuisine_avoid") or []) if isinstance(x, str) and str(x).strip()]
+    if wanted:
+        cuisine_s = ", ".join(wanted[:6]) + ("…" if len(wanted) > 6 else "")
+    elif avoided:
+        cuisine_s = f"без ограничений по типу; исключить: {', '.join(avoided[:4])}"
+    else:
+        cuisine_s = "без ограничений по кухне"
+
+    lines = [
+        "Параметры поиска (проверьте и подтвердите):",
+        f"- Город: {city}",
+        f"- Гостей: {party_s}",
+        f"- Бюджет: {budget_s}",
+        f"- Локация: {loc_s}",
+        f"- Кухня: {cuisine_s}",
+        "",
+        "Если всё верно — нажмите «Подтвердить поиск» под чатом. "
+        "Чтобы изменить параметры — напишите уточнение в чате.",
+    ]
+    return "\n".join(lines)
+
+
+def _fmt_money(v: float) -> str:
+    if abs(v - round(v)) < 0.005:
+        return str(int(round(v)))
+    return f"{v:.0f}"
+
+
 class RecState(TypedDict, total=False):
     session_id: str
     current_node: str
@@ -49,6 +150,11 @@ class RecState(TypedDict, total=False):
     booking_missing_fields: List[str]
     reservation_result: Dict[str, Any]
     booking_errors: List[str]
+    # plan → act: user must confirm extracted search params before Yandex/Afisha
+    search_plan_confirmed: bool
+    search_plan_fingerprint: Optional[str]
+    repeated_missing_fields: List[str]
+    requirements_prompt_count: int
     # analytics: append-only events persisted in graph_state.context
     pipeline_trace: List[Dict[str, Any]]
 
@@ -93,6 +199,58 @@ class GraphRunner:
                 c = candidates[idx]
                 if isinstance(c, dict):
                     booking_selected_override = c
+            if booking_selected_override is None:
+                reply = "Не удалось выбрать ресторан: обновите список и попробуйте ещё раз."
+                await self.state_repository.append_history(
+                    session_id=session_id,
+                    messages=messages,
+                    reply=reply,
+                )
+                updated_state = await self.state_repository.get_state_for_session(session_id)
+                return {"reply": reply, "session_id": session_id, "state": updated_state.to_dict()}
+
+            next_ctx: Dict[str, Any] = dict(ctx)
+            next_ctx["booking_pending"] = True
+            next_ctx["booking_selected_candidate"] = booking_selected_override
+            next_ctx["booking_complete"] = False
+            next_ctx["booking_missing_fields"] = ["starts_at", "guest_count", "guest_name", "guest_phone"]
+            next_ctx["booking_errors"] = []
+            if not isinstance(next_ctx.get("booking_requirements"), dict):
+                next_ctx["booking_requirements"] = {}
+            reply = "Ресторан выбран. Заполните форму бронирования ниже и нажмите «Отправить заявку»."
+            await self.state_repository.append_history(
+                session_id=session_id,
+                messages=messages,
+                reply=reply,
+            )
+            await self.state_repository.update_current_node_and_context(
+                session_id=session_id,
+                current_node="select_booking_candidate",
+                context=next_ctx,
+            )
+            updated_state = await self.state_repository.get_state_for_session(session_id)
+            return {"reply": reply, "session_id": session_id, "state": updated_state.to_dict()}
+
+        form_booking_payload: Optional[Dict[str, Any]] = None
+        if client_action and client_action.get("type") == "submit_booking":
+            if not bool(ctx.get("booking_pending")):
+                reply = (
+                    "Сейчас нет активной заявки на бронь. "
+                    "Сначала получите рекомендации и выберите ресторан."
+                )
+                await self.state_repository.append_history(
+                    session_id=session_id,
+                    messages=messages,
+                    reply=reply,
+                )
+                updated_state = await self.state_repository.get_state_for_session(session_id)
+                return {"reply": reply, "session_id": session_id, "state": updated_state.to_dict()}
+            form_booking_payload = {
+                "starts_at": str(client_action.get("starts_at") or "").strip(),
+                "guest_count": int(client_action["guest_count"]),
+                "guest_name": str(client_action.get("guest_name") or "").strip(),
+                "guest_phone": str(client_action.get("guest_phone") or "").strip(),
+            }
 
         llm_client, system_prompt, node_params = self.llm_registry.get_default_node()
 
@@ -129,7 +287,21 @@ class GraphRunner:
             return "\n\n".join(parts)
 
         async def extract_requirements_node(state: RecState) -> RecState:
+            if form_booking_payload is not None:
+                return {
+                    **state,
+                    "current_node": "extract_requirements",
+                    "pipeline_trace": _trace_append(
+                        state,
+                        "extract_requirements",
+                        {"skipped_llm": True, "reason": "submit_booking_form"},
+                    ),
+                }
+
             prev_req: Dict[str, Any] = dict(state.get("recommendation_requirements") or {})
+            prev_missing_fields: List[str] = [
+                str(x) for x in (state.get("missing_fields") or []) if isinstance(x, str)
+            ]
 
             def _is_num(v: Any) -> bool:
                 return isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -171,10 +343,50 @@ class GraphRunner:
                 slug_ok = isinstance(slug, str) and bool(slug.strip())
                 if city_has and not slug_ok:
                     out.append("city_slug")
-                occ = req.get("occasion")
-                if not (isinstance(occ, str) and bool(occ.strip())):
-                    out.append("occasion")
                 return out
+
+            if client_action and client_action.get("type") == "confirm_search_plan":
+                if bool(state.get("booking_pending")):
+                    return {
+                        **state,
+                        "current_node": "extract_requirements",
+                        "pipeline_trace": _trace_append(
+                            state,
+                            "extract_requirements",
+                            {"skipped_llm": True, "reason": "confirm_ignored_booking_pending"},
+                        ),
+                    }
+                req0 = dict(state.get("recommendation_requirements") or {})
+                miss0 = _missing_fields_for_req(req0)
+                if miss0:
+                    return {
+                        **state,
+                        "current_node": "extract_requirements",
+                        "requirements_complete": False,
+                        "missing_fields": miss0,
+                        "search_plan_confirmed": bool(state.get("search_plan_confirmed")),
+                        "search_plan_fingerprint": state.get("search_plan_fingerprint"),
+                        "pipeline_trace": _trace_append(
+                            state,
+                            "extract_requirements",
+                            {"confirm_rejected": True, "missing_fields": miss0},
+                        ),
+                    }
+                fp0 = fingerprint_search_plan(req0)
+                return {
+                    **state,
+                    "current_node": "extract_requirements",
+                    "recommendation_requirements": req0,
+                    "requirements_complete": True,
+                    "missing_fields": [],
+                    "search_plan_confirmed": True,
+                    "search_plan_fingerprint": fp0,
+                    "pipeline_trace": _trace_append(
+                        state,
+                        "extract_requirements",
+                        {"skipped_llm": True, "reason": "confirm_search_plan", "fingerprint": fp0},
+                    ),
+                }
 
             user_dialog_text = _user_dialog_text_for_requirements_extraction()
             prompt_sys = (
@@ -192,7 +404,7 @@ class GraphRunner:
                 "Считай это **общим бюджетом на всю компанию** (всех гостей на визит), если пользователь явно не сказал «на человека». Иначе null.\n"
                 "location — type metro|area и value, если пользователь назвал станцию, линию, район, улицу как ориентир; "
                 "type none и value null, если локацию не называли.\n"
-                "occasion — только если повод назван явно (в т.ч. «годовщина свадьбы», «день рождения»). Иначе пусто/null.\n\n"
+                "occasion — опционально, только если пользователь сам назвал повод (для контекста/UI); на поиск и ранжирование не влияет.\n\n"
                 "Поля requirements_complete и missing_fields в ответе игнорируются — их пересчитает система; всё равно заполни честно по правилам выше.\n\n"
                 "Структура JSON:\n"
                 "- requirements_complete: true/false (вспомогательно для модели)\n"
@@ -216,10 +428,23 @@ class GraphRunner:
                 f"{json.dumps(state.get('recommendation_requirements', {}), ensure_ascii=False)}"
             )
 
-            raw = await llm_client.chat(
-                messages=[{"role": "system", "content": prompt_sys}, {"role": "user", "content": user_msg}],
-                **node_params,
-            )
+            params_req = {**node_params, "response_format": {"type": "json_object"}}
+            try:
+                raw = await llm_client.chat(
+                    messages=[
+                        {"role": "system", "content": prompt_sys},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    **params_req,
+                )
+            except Exception:
+                raw = await llm_client.chat(
+                    messages=[
+                        {"role": "system", "content": prompt_sys},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    **node_params,
+                )
 
             # parse JSON
             try:
@@ -237,12 +462,16 @@ class GraphRunner:
                     _pc if isinstance(_pc, str) else None
                 )
                 miss = _missing_fields_for_req(prev_fixed)
+                fp_fail = fingerprint_search_plan(prev_fixed)
                 return {
                     **state,
                     "current_node": "extract_requirements",
                     "requirements_complete": len(miss) == 0,
                     "missing_fields": miss,
+                    "repeated_missing_fields": [x for x in miss if x in set(prev_missing_fields)],
                     "recommendation_requirements": prev_fixed,
+                    "search_plan_confirmed": False,
+                    "search_plan_fingerprint": fp_fail,
                     "pipeline_trace": _trace_append(
                         state,
                         "extract_requirements",
@@ -387,6 +616,15 @@ class GraphRunner:
 
             missing_fields = _missing_fields_for_req(normalized)
             requirements_complete = len(missing_fields) == 0
+            repeated_missing_fields = [x for x in missing_fields if x in set(prev_missing_fields)]
+
+            new_fp = fingerprint_search_plan(normalized)
+            old_fp = state.get("search_plan_fingerprint")
+            had_confirmed = bool(state.get("search_plan_confirmed"))
+            if had_confirmed and old_fp is not None and new_fp != old_fp:
+                confirmed_out = False
+            else:
+                confirmed_out = had_confirmed
 
             return {
                 **state,
@@ -394,6 +632,9 @@ class GraphRunner:
                 "recommendation_requirements": normalized,
                 "requirements_complete": requirements_complete,
                 "missing_fields": missing_fields,
+                "repeated_missing_fields": repeated_missing_fields,
+                "search_plan_confirmed": confirmed_out,
+                "search_plan_fingerprint": new_fp,
                 "pipeline_trace": _trace_append(
                     state,
                     "extract_requirements",
@@ -404,9 +645,22 @@ class GraphRunner:
                         "city_slug": resolved_city_slug,
                         "party_size": merged_party,
                         "merged_with_previous": True,
+                        "search_plan_fingerprint": new_fp,
+                        "search_plan_confirmed": confirmed_out,
                     },
                 ),
             }
+
+        async def confirm_search_plan_node(state: RecState) -> RecState:
+            req = state.get("recommendation_requirements") or {}
+            state["reply"] = format_search_plan_summary(req if isinstance(req, dict) else {})
+            state["current_node"] = "confirm_search_plan"
+            state["pipeline_trace"] = _trace_append(
+                state,
+                "confirm_search_plan",
+                {"fingerprint": fingerprint_search_plan(req if isinstance(req, dict) else {})},
+            )
+            return state
 
         async def ask_questions_node(state: RecState) -> RecState:
             missing = state.get("missing_fields") or [
@@ -414,26 +668,87 @@ class GraphRunner:
                 "party_size",
                 "budget_range",
                 "location_or_metro",
-                "occasion",
             ]
+            repeated_missing = [
+                str(x) for x in (state.get("repeated_missing_fields") or []) if isinstance(x, str)
+            ]
+            prompt_count = int(state.get("requirements_prompt_count") or 0)
             field_labels: Dict[str, str] = {
                 "city": "в каком городе ищем ресторан",
                 "city_slug": "уточните название города (как в обычном адресе), чтобы найти рестораны в каталоге Афиши",
                 "party_size": "сколько человек будет (число участников)",
                 "budget_range": "общий бюджет на компанию в рублях (от … до … на весь визит)",
                 "location_or_metro": "район или станция метро, где удобно",
-                "occasion": "повод встречи",
             }
-            lines = [f"- {field_labels.get(code, code)}" for code in missing]
-            reply = (
-                "Чтобы подобрать подходящие рестораны, уточните, пожалуйста:\n"
-                + "\n".join(lines)
-                + "\n\nМожно ответить одним сообщением со всеми пунктами."
+            required_lines = [f"- {field_labels.get(code, code)}" for code in missing]
+            repeated_lines = [f"- {field_labels.get(code, code)}" for code in repeated_missing]
+            mandatory_fields = [
+                "город",
+                "количество гостей",
+                "общий бюджет на компанию",
+                "район или метро",
+            ]
+            prompt_sys = (
+                "Ты дружелюбный ассистент по подбору ресторанов. "
+                "Сформулируй одно короткое человеческое уточнение пользователю на русском языке (2-5 предложений), "
+                "без сухого канцелярита и без дословного повторения предыдущего вопроса.\n"
+                "Обязательно объясни, что есть обязательный минимум полей для эффективного поиска, "
+                "и почему он нужен (чтобы сузить выдачу и избежать нерелевантных вариантов).\n"
+                "Если есть repeated_missing, мягко укажи, что эти поля не удалось однозначно понять из прошлого ответа, "
+                "и попроси уточнить их снова.\n"
+                "Запрашивай только поля из missing. В конце добавь фразу, что можно ответить одним сообщением."
             )
+            prompt_user = (
+                f"Это {'первый' if prompt_count == 0 else 'повторный'} запрос уточнений.\n"
+                f"Обязательный минимум полей: {', '.join(mandatory_fields)}.\n"
+                "Сейчас нужно уточнить:\n"
+                + "\n".join(required_lines)
+                + "\n\n"
+                + (
+                    "Поля, которые уже спрашивали и не удалось однозначно извлечь:\n"
+                    + "\n".join(repeated_lines)
+                    + "\n\n"
+                    if repeated_lines
+                    else ""
+                )
+                + "Сформулируй ответ для пользователя."
+            )
+            try:
+                reply = (
+                    await llm_client.chat(
+                        messages=[
+                            {"role": "system", "content": prompt_sys},
+                            {"role": "user", "content": prompt_user},
+                        ],
+                        **node_params,
+                    )
+                ).strip()
+            except Exception:
+                reply = ""
+
+            if not reply:
+                intro = (
+                    "Чтобы эффективно подобрать подходящие рестораны, нужен обязательный минимум данных: "
+                    "город, количество гостей, бюджет и район/метро.\n"
+                )
+                if repeated_lines:
+                    intro += (
+                        "Часть параметров из прошлого ответа не удалось определить однозначно, уточните, пожалуйста:\n"
+                    )
+                else:
+                    intro += "Уточните, пожалуйста:\n"
+                reply = intro + "\n".join(required_lines) + "\n\nМожно ответить одним сообщением со всеми пунктами."
             state["reply"] = reply
             state["current_node"] = "ask_questions"
+            state["requirements_prompt_count"] = prompt_count + 1
             state["pipeline_trace"] = _trace_append(
-                state, "ask_questions", {"missing_fields": missing}
+                state,
+                "ask_questions",
+                {
+                    "missing_fields": missing,
+                    "repeated_missing_fields": repeated_missing,
+                    "requirements_prompt_count": prompt_count + 1,
+                },
             )
             return state
 
@@ -450,18 +765,6 @@ class GraphRunner:
                 if x:
                     cuisine_terms.append(str(x))
             cuisine_part = " ".join(cuisine_terms) if cuisine_terms else ""
-
-            # Map occasion keywords to typical words on Afisha pages
-            occasion = str(req.get("occasion") or "").lower()
-            occasion_terms = []
-            if "день рождения" in occasion or "birthday" in occasion:
-                occasion_terms = ["банкет", "банкеты"]
-            elif "юбилей" in occasion or "anniversary" in occasion:
-                occasion_terms = ["банкеты", "кейтеринг", "банкет"]
-            elif "роман" in occasion:
-                occasion_terms = ["свидание", "романтическая", "уют"]
-
-            occ_part = " ".join(occasion_terms) if occasion_terms else ""
 
             loc_part = f"\"{loc_val}\"" if loc_val else ""
             if not city_slug:
@@ -484,7 +787,7 @@ class GraphRunner:
             # Prefer restaurant-card pages containing метро names in heading.
             base = f"site:afisha.ru {city_slug}/restaurant"
 
-            q1 = " ".join([base, loc_part, cuisine_part, occ_part]).strip()
+            q1 = " ".join([base, loc_part, cuisine_part]).strip()
             q2 = " ".join([base, loc_part, "Средний чек", cuisine_part]).strip()
             q3 = " ".join([base, loc_part, "Открыто", cuisine_part]).strip()
             q4 = " ".join([base, loc_part, "ресторан", cuisine_part]).strip()
@@ -568,6 +871,7 @@ class GraphRunner:
             from .afisha_urls import filter_and_order_afisha_restaurant_urls
 
             candidates: List[Dict[str, Any]] = []
+            skipped_closed = 0
             urls = filter_and_order_afisha_restaurant_urls(list(state.get("yandex_urls") or []))[
                 :30
             ]
@@ -576,6 +880,9 @@ class GraphRunner:
                     cand = await fetch_and_parse_afisha_card(url)
                     # basic sanity
                     if not cand.get("name") and not cand.get("metro"):
+                        continue
+                    if cand.get("venue_closed"):
+                        skipped_closed += 1
                         continue
                     candidates.append(cand)
                 except Exception:
@@ -589,31 +896,67 @@ class GraphRunner:
                     "fetch_afisha_cards",
                     {
                         "candidate_count": len(candidates),
+                        "skipped_closed": skipped_closed,
                         "names": [c.get("name") for c in candidates[:10]],
                     },
                 ),
             }
 
+        async def toka_capacity_gate_node(state: RecState) -> RecState:
+            from .toka_candidate_capacity import apply_toka_capacity_gate
+
+            req = state.get("recommendation_requirements") or {}
+            ps = req.get("party_size")
+            try:
+                party_n = int(ps) if ps is not None and not isinstance(ps, bool) else 1
+            except Exception:
+                party_n = 1
+            party_n = max(1, party_n)
+
+            candidates = list(state.get("candidates") or [])
+            gated, extra_err = await apply_toka_capacity_gate(candidates, party_n)
+            errors = list(state.get("service_errors") or [])
+            errors.extend(extra_err)
+
+            return {
+                **state,
+                "current_node": "toka_capacity_gate",
+                "candidates": gated,
+                "service_errors": errors,
+                "pipeline_trace": _trace_append(
+                    state,
+                    "toka_capacity_gate",
+                    {
+                        "in_count": len(candidates),
+                        "out_count": len(gated),
+                        "party_size": party_n,
+                    },
+                ),
+            }
+
         async def formal_rank_node(state: RecState) -> RecState:
-            from .recommendation_ranker import rank_candidates
+            from .recommendation_ranker import rank_candidates, recalc_formal_thresholds
+            from .toka_candidate_capacity import apply_toka_unverified_score_penalty
 
             requirements = state.get("recommendation_requirements") or {}
             candidates = state.get("candidates") or []
 
             ranked = rank_candidates(candidates, requirements)
             sc = ranked.get("scored_candidates") or []
+            apply_toka_unverified_score_penalty(sc)
+            min_s, above_n = recalc_formal_thresholds(sc)
             return {
                 **state,
                 "current_node": "formal_rank",
                 "scored_candidates": sc,
-                "min_score": ranked.get("min_score") or 0.0,
-                "above_threshold_count": ranked.get("above_threshold_count") or 0,
+                "min_score": min_s,
+                "above_threshold_count": above_n,
                 "pipeline_trace": _trace_append(
                     state,
                     "formal_rank",
                     {
-                        "min_score": ranked.get("min_score"),
-                        "above_threshold_count": ranked.get("above_threshold_count"),
+                        "min_score": min_s,
+                        "above_threshold_count": above_n,
                         "top_preview": [
                             {"url": x.get("url"), "formal_score": x.get("formal_score")}
                             for x in sorted(
@@ -700,9 +1043,6 @@ class GraphRunner:
             from .afisha_reviews_parser import fetch_and_extract_reviews
             from .review_aspect_extractor import extract_aspects_from_reviews
 
-            req = state.get("recommendation_requirements") or {}
-            occasion = str(req.get("occasion") or "")
-
             shortlist = state.get("shortlist") or []
             reviews_aspects: List[Dict[str, Any]] = []
             for item in shortlist:
@@ -715,7 +1055,6 @@ class GraphRunner:
                         llm_client,
                         node_params,
                         reviews=reviews,
-                        occasion=occasion,
                         restaurant_name=item.get("name"),
                     )
                     reviews_aspects.append({"url": url, "aspects": aspects.get("aspects"), "evidence_count": aspects.get("evidence_count", 0)})
@@ -733,9 +1072,6 @@ class GraphRunner:
             }
 
         async def final_rerank_and_explain_node(state: RecState) -> RecState:
-            req = state.get("recommendation_requirements") or {}
-            occasion = str(req.get("occasion") or "").lower()
-
             shortlist = state.get("shortlist") or []
             reviews_aspects = state.get("reviews_aspects") or []
             aspects_by_url = {a.get("url"): a for a in reviews_aspects if a.get("url")}
@@ -743,26 +1079,9 @@ class GraphRunner:
             def reviews_bonus(aspects: Optional[Dict[str, Any]]) -> float:
                 if not aspects:
                     return 0.0
-                # Map occasion to which aspects matter; keep deterministic and small.
-                if "роман" in occasion:
-                    return 0.2 * float(aspects.get("ambience", {}).get("score") or 0.0) + 0.1 * float(
-                        aspects.get("noise", {}).get("score") or 0.0
-                    ) + 0.05 * float(aspects.get("food", {}).get("score") or 0.0)
-                if (
-                    "юбилей" in occasion
-                    or "anniversary" in occasion
-                    or "годовщин" in occasion
-                    or "свадьб" in occasion
-                    or "wedding" in occasion
-                ):
-                    return 0.15 * float(aspects.get("service", {}).get("score") or 0.0) + 0.1 * float(
-                        aspects.get("food", {}).get("score") or 0.0
-                    ) + 0.05 * float(aspects.get("value", {}).get("score") or 0.0)
-                if "день рождения" in occasion or "birthday" in occasion:
-                    return 0.15 * float(aspects.get("service", {}).get("score") or 0.0) + 0.1 * float(
-                        aspects.get("food", {}).get("score") or 0.0
-                    ) + 0.05 * float(aspects.get("ambience", {}).get("score") or 0.0)
-                return 0.1 * float(aspects.get("food", {}).get("score") or 0.0)
+                return 0.1 * float(aspects.get("food", {}).get("score") or 0.0) + 0.06 * float(
+                    aspects.get("service", {}).get("score") or 0.0
+                ) + 0.04 * float(aspects.get("ambience", {}).get("score") or 0.0)
 
             final: List[Dict[str, Any]] = []
             for item in shortlist:
@@ -778,8 +1097,6 @@ class GraphRunner:
                     reasons.append("соответствует бюджету (по среднему чеку)");
                 if item.get("cuisine_score") is not None and float(item["cuisine_score"]) > 0:
                     reasons.append("совпадает по кухне/тегам");
-                if item.get("occasion_score") is not None and float(item["occasion_score"]) > 0:
-                    reasons.append("подходит под повод (банкет/кейтеринг/формат)");
 
                 ev = None
                 if aspects:
@@ -820,7 +1137,6 @@ class GraphRunner:
                     state,
                     "final_rerank_and_explain",
                     {
-                        "occasion_hint": occasion[:120],
                         "top5": [
                             {"url": x.get("url"), "name": x.get("name"), "final_score": x.get("final_score")}
                             for x in top5
@@ -842,6 +1158,7 @@ class GraphRunner:
                     reply = "В этой локации с заданными критериями подходящих ресторанов не нашлось. Попробовать расширить локацию или бюджет?"
                 state["reply"] = reply
                 state["booking_pending"] = False
+                state["search_plan_confirmed"] = False
                 state["current_node"] = "format_reply"
                 state["pipeline_trace"] = _trace_append(
                     state, "format_reply", {"empty_candidates": True, "had_service_errors": bool(errors)}
@@ -866,6 +1183,7 @@ class GraphRunner:
             state["booking_missing_fields"] = ["starts_at", "guest_count", "guest_name", "guest_phone"]
             state["booking_errors"] = []
             state["current_node"] = "format_reply"
+            state["search_plan_confirmed"] = False
             state["pipeline_trace"] = _trace_append(
                 state,
                 "format_reply",
@@ -879,127 +1197,72 @@ class GraphRunner:
 
             This node is used when `booking_pending=true` (set right after recommendations).
             """
-            last_user = _last_user_text()
-            sys = (
-                "Ты извлекаешь параметры для бронирования столика через Toka.\n"
-                "Верни ТОЛЬКО JSON без markdown.\n"
-                "Поля:\n"
-                "- booking_complete: true/false\n"
-                "- missing_fields: массив строк (из множества: starts_at, guest_count, guest_name, guest_phone)\n"
-                "- booking_requirements: объект со следующими полями:\n"
-                "  starts_at (ISO-8601 datetime, например 2026-04-02T19:00:00Z)\n"
-                "  duration_minutes (number, по умолчанию 120 если не указано)\n"
-                "  guest_name (string)\n"
-                "  guest_phone (string)\n"
-                "  guest_count (number, >=1)\n"
-                "  notes (string, можно пустым)\n"
-            )
-            user_msg = (
-                "СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ (для бронирования):\n"
-                f"{last_user}\n\n"
-                "Контекст (если был):\n"
-                f"{json.dumps(state.get('booking_requirements') or {}, ensure_ascii=False)}"
-            )
-
-            raw = await llm_client.chat(
-                messages=[{"role": "system", "content": sys}, {"role": "user", "content": user_msg}],
-                **node_params,
-            )
-
-            try:
-                json_text = raw
-                start = json_text.find("{")
-                end = json_text.rfind("}")
-                if start >= 0 and end > start:
-                    json_text = json_text[start : end + 1]
-                parsed = json.loads(json_text)
-            except Exception:
-                return {
-                    **state,
-                    "current_node": "extract_booking_requirements",
-                    "booking_pending": True,
-                    "booking_complete": False,
-                    "booking_missing_fields": ["starts_at", "guest_count", "guest_name", "guest_phone"],
-                    "booking_requirements": {},
-                    "pipeline_trace": _trace_append(
-                        state,
-                        "extract_booking_requirements",
-                        {"parse_ok": False},
-                    ),
-                }
-
-            br = parsed.get("booking_requirements") or {}
-            if not isinstance(br, dict):
-                br = {}
-
-            missing_fields: List[str] = []
-
-            def _is_non_empty_str(v: Any) -> bool:
-                return isinstance(v, str) and bool(v.strip())
 
             def _norm_iso_datetime(v: Any) -> Optional[str]:
                 if not isinstance(v, str):
                     return None
                 s = v.strip()
-                # Accept common ISO patterns with Z or timezone offset.
-                # Example: 2026-04-02T19:00:00Z / 2026-04-02T19:00:00+03:00
                 if not any(t in s for t in ["T", "-"]):
                     return None
-                # Lightweight validation to avoid over-rejecting.
                 return s
 
-            starts_at = _norm_iso_datetime(br.get("starts_at"))
-            if not starts_at:
-                missing_fields.append("starts_at")
-
-            guest_count = br.get("guest_count")
-            guest_count_norm: Optional[int] = None
-            if isinstance(guest_count, (int, float)) and not isinstance(guest_count, bool):
-                if int(guest_count) >= 1:
-                    guest_count_norm = int(guest_count)
-            if guest_count_norm is None:
-                missing_fields.append("guest_count")
-
-            guest_name = br.get("guest_name")
-            if not _is_non_empty_str(guest_name):
-                missing_fields.append("guest_name")
-
-            guest_phone = br.get("guest_phone")
-            if not _is_non_empty_str(guest_phone):
-                missing_fields.append("guest_phone")
-
-            duration_minutes = br.get("duration_minutes")
-            duration_minutes_norm = 120
-            if isinstance(duration_minutes, (int, float)) and not isinstance(duration_minutes, bool):
-                dm = int(duration_minutes)
-                if dm > 0:
-                    duration_minutes_norm = dm
-
-            notes = br.get("notes") or ""
-            notes_norm = notes if isinstance(notes, str) else ""
-
-            booking_complete = len(missing_fields) == 0
-
-            normalized_req: Dict[str, Any] = {
-                "starts_at": starts_at,
-                "duration_minutes": duration_minutes_norm,
-                "guest_name": guest_name.strip() if isinstance(guest_name, str) else None,
-                "guest_phone": guest_phone.strip() if isinstance(guest_phone, str) else None,
-                "guest_count": guest_count_norm,
-                "notes": notes_norm,
-            }
+            if form_booking_payload is not None:
+                fb = form_booking_payload
+                starts_at = _norm_iso_datetime(str(fb.get("starts_at") or ""))
+                missing_fields_fb: List[str] = []
+                if not starts_at:
+                    missing_fields_fb.append("starts_at")
+                gc_raw = fb.get("guest_count")
+                guest_count_norm_fb: Optional[int] = None
+                if isinstance(gc_raw, (int, float)) and not isinstance(gc_raw, bool):
+                    if int(gc_raw) >= 1:
+                        guest_count_norm_fb = int(gc_raw)
+                if guest_count_norm_fb is None:
+                    missing_fields_fb.append("guest_count")
+                gn_fb = fb.get("guest_name")
+                if not (isinstance(gn_fb, str) and gn_fb.strip()):
+                    missing_fields_fb.append("guest_name")
+                gp_fb = fb.get("guest_phone")
+                if not (isinstance(gp_fb, str) and gp_fb.strip()):
+                    missing_fields_fb.append("guest_phone")
+                booking_complete_fb = len(missing_fields_fb) == 0
+                normalized_fb: Dict[str, Any] = {
+                    "starts_at": starts_at,
+                    "duration_minutes": 120,
+                    "guest_name": gn_fb.strip() if isinstance(gn_fb, str) else None,
+                    "guest_phone": gp_fb.strip() if isinstance(gp_fb, str) else None,
+                    "guest_count": guest_count_norm_fb,
+                    "notes": "",
+                }
+                return {
+                    **state,
+                    "current_node": "extract_booking_requirements",
+                    "booking_pending": True,
+                    "booking_complete": booking_complete_fb,
+                    "booking_missing_fields": missing_fields_fb,
+                    "booking_requirements": normalized_fb,
+                    "pipeline_trace": _trace_append(
+                        state,
+                        "extract_booking_requirements",
+                        {
+                            "source": "submit_booking_form",
+                            "booking_complete": booking_complete_fb,
+                            "missing": missing_fields_fb,
+                        },
+                    ),
+                }
 
             return {
                 **state,
                 "current_node": "extract_booking_requirements",
                 "booking_pending": True,
-                "booking_complete": booking_complete,
-                "booking_missing_fields": missing_fields,
-                "booking_requirements": normalized_req,
+                "booking_complete": False,
+                "booking_missing_fields": ["starts_at", "guest_count", "guest_name", "guest_phone"],
+                "booking_requirements": state.get("booking_requirements") or {},
                 "pipeline_trace": _trace_append(
                     state,
                     "extract_booking_requirements",
-                    {"parse_ok": True, "booking_complete": booking_complete, "missing": missing_fields},
+                    {"source": "no_form_payload", "booking_complete": False},
                 ),
             }
 
@@ -1025,95 +1288,21 @@ class GraphRunner:
             req = state.get("booking_requirements") or {}
             booking_errors: List[str] = []
             try:
-                from ..services.toka_client import (
-                    TokaBackofficeClient,
-                    TokaClientError,
-                    find_table_capacity,
-                    get_toka_backoffice_client,
-                )
+                from ..services.toka_gateway import get_toka_gateway
 
-                client: TokaBackofficeClient = await get_toka_backoffice_client()
-
-                def _pick_id(obj: Dict[str, Any]) -> Optional[str]:
-                    if not isinstance(obj, dict):
-                        return None
-                    for k in ("id", "store_id", "storeId", "organization_id", "organizationId"):
-                        v = obj.get(k)
-                        if v is not None and str(v).strip():
-                            return str(v)
-                    return None
-
-                organizations = await client.get_my_organizations()
-                org_items = list(organizations.get("items") or [])
-                if not org_items:
-                    raise RuntimeError("Toka: no organizations returned")
-                org_id = _pick_id(org_items[0])
-                if not org_id:
-                    raise RuntimeError("Toka: cannot extract org_id from organizations item")
-
-                stores = await client.list_stores(org_id)
-                store_items = list(stores.get("items") or [])
-                if not store_items:
-                    raise RuntimeError("Toka: no stores returned")
-                chosen_store = None
-                for st in store_items:
-                    if st.get("has_tables") is True:
-                        chosen_store = st
-                        break
-                chosen_store = chosen_store or store_items[0]
-                store_id = _pick_id(chosen_store)
-                if not store_id:
-                    raise RuntimeError("Toka: cannot extract store_id from store item")
-
-                org_id_str = org_id
-                store_id_str = store_id
-
-                halls = await client.get_halls_and_tables(org_id_str, store_id_str)
-
-                guest_count = int(req.get("guest_count"))
-                # Pick the smallest table that fits guest_count.
-                chosen_table_id: Optional[str] = None
-                chosen_capacity: Optional[int] = None
-                for hall in halls.get("items") or []:
-                    for table in hall.get("tables") or []:
-                        cap = table.get("capacity")
-                        if cap is None:
-                            continue
-                        try:
-                            cap_i = int(cap)
-                        except Exception:
-                            continue
-                        if cap_i < guest_count:
-                            continue
-                        tid = table.get("id")
-                        if tid is None:
-                            continue
-                        tid_str = str(tid)
-                        if chosen_capacity is None or cap_i < chosen_capacity:
-                            chosen_capacity = cap_i
-                            chosen_table_id = tid_str
-
-                if not chosen_table_id:
-                    raise RuntimeError("Toka: no tables with enough capacity for guest_count")
-
-                cap_check = find_table_capacity(halls, chosen_table_id)
-                if cap_check is not None and guest_count > cap_check:
-                    raise RuntimeError("Toka: chosen table capacity is smaller than guest_count")
-
+                gateway = await get_toka_gateway()
                 starts_at = str(req.get("starts_at"))
-                duration_minutes = int(req.get("duration_minutes") or 120)
-                payload = {
-                    "table_id": chosen_table_id,
-                    "starts_at": starts_at,
-                    "duration_minutes": duration_minutes,
-                    "guest_name": str(req.get("guest_name") or ""),
-                    "guest_phone": str(req.get("guest_phone") or ""),
-                    "guest_count": guest_count,
-                    "notes": str(req.get("notes") or ""),
-                    "source": "agent",
-                }
-
-                reservation = await client.create_reservation(org_id_str, store_id_str, payload)
+                guest_count = int(req.get("guest_count"))
+                reservation_data = await gateway.create_reservation(
+                    restaurant_ref=dict(state.get("booking_selected_candidate") or {}),
+                    starts_at=starts_at,
+                    duration_minutes=int(req.get("duration_minutes") or 120),
+                    guest_name=str(req.get("guest_name") or ""),
+                    guest_phone=str(req.get("guest_phone") or ""),
+                    guest_count=guest_count,
+                    notes=str(req.get("notes") or ""),
+                )
+                reservation = reservation_data.get("raw") or reservation_data
                 state["reservation_result"] = reservation
                 state["booking_pending"] = False
                 state["booking_complete"] = True
@@ -1140,7 +1329,7 @@ class GraphRunner:
                     {
                         "ok": True,
                         "reservation_id": reservation_id,
-                        "store_id": store_id_str,
+                        "store_id": (reservation_data.get("resolved") or {}).get("store_id"),
                     },
                 )
                 return state
@@ -1165,10 +1354,12 @@ class GraphRunner:
         graph = StateGraph(RecState)
         graph.add_node("extract_requirements", extract_requirements_node)
         graph.add_node("ask_questions", ask_questions_node)
+        graph.add_node("confirm_search_plan", confirm_search_plan_node)
         graph.add_node("build_yandex_queries", build_yandex_queries_node)
         graph.add_node("yandex_web_search", yandex_web_search_node)
         graph.add_node("dedupe_and_filter_urls", dedupe_and_filter_urls_node)
         graph.add_node("fetch_afisha_cards", fetch_afisha_cards_node)
+        graph.add_node("toka_capacity_gate", toka_capacity_gate_node)
         graph.add_node("formal_rank", formal_rank_node)
         graph.add_node("take_shortlist", take_shortlist_node)
         graph.add_node("relax_fallback", relax_criteria_fallback_node)
@@ -1181,18 +1372,27 @@ class GraphRunner:
 
         graph.set_entry_point("extract_requirements")
 
+        def route_after_extract(s: RecState) -> str:
+            if s.get("booking_pending"):
+                return "extract_booking_requirements"
+            if not s.get("requirements_complete"):
+                return "ask_questions"
+            if not bool(s.get("search_plan_confirmed")):
+                return "confirm_search_plan"
+            return "build_yandex_queries"
+
         graph.add_conditional_edges(
             "extract_requirements",
-            lambda s: "extract_booking_requirements"
-            if s.get("booking_pending")
-            else ("ask_questions" if not s.get("requirements_complete") else "build_yandex_queries"),
+            route_after_extract,
             path_map={
                 "extract_booking_requirements": "extract_booking_requirements",
                 "ask_questions": "ask_questions",
+                "confirm_search_plan": "confirm_search_plan",
                 "build_yandex_queries": "build_yandex_queries",
             },
         )
         graph.add_edge("ask_questions", END)
+        graph.add_edge("confirm_search_plan", END)
         graph.add_conditional_edges(
             "extract_booking_requirements",
             lambda s: "create_reservation" if s.get("booking_complete") else "ask_booking_questions",
@@ -1207,7 +1407,8 @@ class GraphRunner:
         graph.add_edge("build_yandex_queries", "yandex_web_search")
         graph.add_edge("yandex_web_search", "dedupe_and_filter_urls")
         graph.add_edge("dedupe_and_filter_urls", "fetch_afisha_cards")
-        graph.add_edge("fetch_afisha_cards", "formal_rank")
+        graph.add_edge("fetch_afisha_cards", "toka_capacity_gate")
+        graph.add_edge("toka_capacity_gate", "formal_rank")
 
         def route_after_rank(s: RecState) -> str:
             cnt = int(s.get("above_threshold_count") or 0)
@@ -1266,6 +1467,12 @@ class GraphRunner:
             "recommendation_requirements": graph_state.context.get("recommendation_requirements") if graph_state.context else {},
             "requirements_complete": False,
             "missing_fields": [],
+            "repeated_missing_fields": [],
+            "requirements_prompt_count": int(_ctx.get("requirements_prompt_count") or 0),
+            "search_plan_confirmed": bool(_ctx.get("search_plan_confirmed")),
+            "search_plan_fingerprint": _ctx.get("search_plan_fingerprint")
+            if isinstance(_ctx.get("search_plan_fingerprint"), str)
+            else None,
             "booking_pending": bool(graph_state.context.get("booking_pending")) if graph_state.context else False,
             "booking_selected_candidate": booking_selected_initial,
             "booking_requirements": (graph_state.context.get("booking_requirements") if graph_state.context else {}) or {},
