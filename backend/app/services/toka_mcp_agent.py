@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import os
-from typing import Any, Dict, Optional, Tuple
+import asyncio
+from typing import Any, Dict, Optional
 
 from .toka_client import (
     TokaBackofficeClient,
     TokaClientError,
     find_table_capacity,
-    get_toka_backoffice_client,
+    get_toka_backoffice_client_for_binding,
 )
+from ..storage.database import get_session_maker
+from ..storage.toka_binding_repository import lookup_binding_dto_sync
 
 
 def _ok(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -63,24 +65,58 @@ def _pick_smallest_table_id(halls_payload: Dict[str, Any], guest_count: int) -> 
     return chosen_table_id
 
 
-def _resolve_toka_store_stub(_restaurant_ref: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    # MVP resolver: all external cards map to a single Toka test store from env.
-    org = os.environ.get("TOKA_STUB_ORGANIZATION_ID", "").strip()
-    store = os.environ.get("TOKA_STUB_STORE_ID", "").strip()
-    if not org or not store:
-        return None, None
-    return org, store
-
-
 class TokaMcpAgent:
-    """Subagent-like MCP tool facade that fully owns Toka HTTP interaction."""
+    """
+    MCP-style facade over Toka HTTP calls.
 
-    async def _client(self) -> TokaBackofficeClient:
-        return await get_toka_backoffice_client()
+    Each public method loads the row from ``toka_restaurant_bindings`` for the current
+    restaurant context (name / org_id / store_id) **in that request**, then obtains the
+    HTTP client with that row's ``refresh_token`` — nothing is fixed at application startup.
+    """
+
+    async def _binding_dto(
+        self,
+        *,
+        restaurant_ref: Optional[Dict[str, Any]] = None,
+        organization_id: Optional[str] = None,
+        store_id: Optional[str] = None,
+    ):
+        sm = get_session_maker()
+
+        def _sync():
+            return lookup_binding_dto_sync(
+                sm,
+                restaurant_ref=restaurant_ref,
+                organization_id=organization_id,
+                store_id=store_id,
+            )
+
+        return await asyncio.to_thread(_sync)
+
+    async def _client_for(
+        self,
+        *,
+        restaurant_ref: Optional[Dict[str, Any]] = None,
+        organization_id: Optional[str] = None,
+        store_id: Optional[str] = None,
+    ) -> TokaBackofficeClient:
+        """Resolve binding from DB for this call, then return client with that row's credentials."""
+        dto = await self._binding_dto(
+            restaurant_ref=restaurant_ref,
+            organization_id=organization_id,
+            store_id=store_id,
+        )
+        if dto is None:
+            raise TokaClientError(
+                "No Toka binding in database: add row restaurant_name='default' "
+                "(see init_db seed / toka_restaurant_bindings)."
+            )
+        return await get_toka_backoffice_client_for_binding(dto)
 
     async def toka_list_organizations(self) -> Dict[str, Any]:
         try:
-            data = await (await self._client()).get_my_organizations()
+            client = await self._client_for(restaurant_ref={"name": ""})
+            data = await client.get_my_organizations()
             return _ok({"organizations": list(data.get("items") or [])})
         except TokaClientError as exc:
             return _err("TOKA_API_ERROR", str(exc), retriable=True)
@@ -89,7 +125,11 @@ class TokaMcpAgent:
 
     async def toka_list_stores(self, organization_id: str) -> Dict[str, Any]:
         try:
-            data = await (await self._client()).list_stores(organization_id)
+            client = await self._client_for(
+                restaurant_ref={},
+                organization_id=organization_id,
+            )
+            data = await client.list_stores(organization_id)
             return _ok({"stores": list(data.get("items") or [])})
         except TokaClientError as exc:
             return _err("TOKA_API_ERROR", str(exc), retriable=True)
@@ -98,7 +138,19 @@ class TokaMcpAgent:
 
     async def toka_get_halls_and_tables(self, organization_id: str, store_id: str) -> Dict[str, Any]:
         try:
-            data = await (await self._client()).get_halls_and_tables(organization_id, store_id)
+            dto = await self._binding_dto(
+                restaurant_ref={},
+                organization_id=organization_id,
+                store_id=store_id,
+            )
+            if dto is None:
+                return _err(
+                    "RESOLVER_NOT_CONFIGURED",
+                    "No Toka binding in database for this organization/store (or missing default row).",
+                    retriable=False,
+                )
+            client = await get_toka_backoffice_client_for_binding(dto)
+            data = await client.get_halls_and_tables(organization_id, store_id)
             return _ok({"halls": list(data.get("items") or []), "raw": data})
         except TokaClientError as exc:
             return _err("TOKA_API_ERROR", str(exc), retriable=True)
@@ -113,17 +165,29 @@ class TokaMcpAgent:
     ) -> Dict[str, Any]:
         _ = starts_at
         ps = max(1, int(party_size))
-        org_id, store_id = _resolve_toka_store_stub(candidate_ref)
-        if org_id is None or store_id is None:
-            return _err(
-                "RESOLVER_NOT_CONFIGURED",
-                "Set TOKA_STUB_ORGANIZATION_ID and TOKA_STUB_STORE_ID",
-                retriable=False,
-            )
-        halls_res = await self.toka_get_halls_and_tables(org_id, store_id)
-        if not halls_res.get("ok"):
-            return halls_res
-        raw_halls = halls_res["data"]["raw"]
+        ref = dict(candidate_ref or {})
+        try:
+            dto = await self._binding_dto(restaurant_ref=ref)
+            if dto is None:
+                return _err(
+                    "RESOLVER_NOT_CONFIGURED",
+                    "No Toka org/store in toka_restaurant_bindings for this restaurant (or missing default row).",
+                    retriable=False,
+                )
+            org_id = dto.org_id.strip()
+            store_id = dto.store_id.strip()
+            if not org_id or not store_id:
+                return _err(
+                    "RESOLVER_NOT_CONFIGURED",
+                    "No Toka org/store in toka_restaurant_bindings for this restaurant (or missing default row).",
+                    retriable=False,
+                )
+            client = await get_toka_backoffice_client_for_binding(dto)
+            raw_halls = await client.get_halls_and_tables(org_id, store_id)
+        except TokaClientError as exc:
+            return _err("TOKA_API_ERROR", str(exc), retriable=True)
+        except Exception as exc:
+            return _err("TOKA_UNKNOWN_ERROR", str(exc), retriable=True)
         max_capacity = _max_table_capacity(raw_halls)
         return _ok(
             {
@@ -150,21 +214,35 @@ class TokaMcpAgent:
         store_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         _ = idempotency_key
-        org_id = (organization_id or "").strip() or None
-        st_id = (store_id or "").strip() or None
-        if not org_id or not st_id:
-            org_id, st_id = _resolve_toka_store_stub(restaurant_ref)
-        if not org_id or not st_id:
-            return _err(
-                "RESOLVER_NOT_CONFIGURED",
-                "Set TOKA_STUB_ORGANIZATION_ID and TOKA_STUB_STORE_ID",
-                retriable=False,
+        org_kw = (organization_id or "").strip() or None
+        st_kw = (store_id or "").strip() or None
+        ref = dict(restaurant_ref or {})
+        try:
+            dto = await self._binding_dto(
+                restaurant_ref=ref,
+                organization_id=org_kw,
+                store_id=st_kw,
             )
-
-        halls_res = await self.toka_get_halls_and_tables(org_id, st_id)
-        if not halls_res.get("ok"):
-            return halls_res
-        halls_raw = halls_res["data"]["raw"]
+            if dto is None:
+                return _err(
+                    "RESOLVER_NOT_CONFIGURED",
+                    "No Toka org/store in toka_restaurant_bindings for this restaurant (or missing default row).",
+                    retriable=False,
+                )
+            org_id = dto.org_id.strip()
+            st_id = dto.store_id.strip()
+            if not org_id or not st_id:
+                return _err(
+                    "RESOLVER_NOT_CONFIGURED",
+                    "No Toka org/store in toka_restaurant_bindings for this restaurant (or missing default row).",
+                    retriable=False,
+                )
+            client = await get_toka_backoffice_client_for_binding(dto)
+            halls_raw = await client.get_halls_and_tables(org_id, st_id)
+        except TokaClientError as exc:
+            return _err("TOKA_API_ERROR", str(exc), retriable=True)
+        except Exception as exc:
+            return _err("TOKA_UNKNOWN_ERROR", str(exc), retriable=True)
 
         table_id_str: Optional[str] = str(table_id).strip() if table_id else None
         if table_id_str:
@@ -197,7 +275,7 @@ class TokaMcpAgent:
             "source": "agent",
         }
         try:
-            reservation = await (await self._client()).create_reservation(org_id, st_id, payload)
+            reservation = await client.create_reservation(org_id, st_id, payload)
         except TokaClientError as exc:
             return _err("TOKA_API_ERROR", str(exc), retriable=True)
         except Exception as exc:
@@ -212,10 +290,9 @@ class TokaMcpAgent:
                 "guest_name": guest_name,
                 "guest_phone": guest_phone,
                 "table_id": table_id_str,
-                "restaurant_name": str(restaurant_ref.get("name") or reservation.get("restaurant_name") or ""),
-                "restaurant_address": str(restaurant_ref.get("address") or reservation.get("restaurant_address") or ""),
+                "restaurant_name": str(ref.get("name") or reservation.get("restaurant_name") or ""),
+                "restaurant_address": str(ref.get("address") or reservation.get("restaurant_address") or ""),
                 "raw": reservation,
                 "resolved": {"organization_id": org_id, "store_id": st_id},
             }
         )
-

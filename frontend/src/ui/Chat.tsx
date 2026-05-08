@@ -195,36 +195,38 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
           <span>{resetting ? "Сброс…" : "Новый запрос"}</span>
         </button>
       </div>
-      <div className="chat-messages">
-        {networkError && (
-          <div className="chat-error" role="alert">
-            {networkError}
-          </div>
-        )}
-        {messages.map((m, idx) => (
-          <div
-            key={idx}
-            className={`chat-message chat-message-${m.role}`}
-          >
-            <div className="chat-bubble">{m.content}</div>
-          </div>
-        ))}
-        {loading && (
-          <div className="chat-message chat-message-assistant">
-            <div className="chat-bubble chat-bubble-loading">
-              Думаю над вашим запросом...
+      <div className="chat-scroll-body">
+        <div className="chat-messages">
+          {networkError && (
+            <div className="chat-error" role="alert">
+              {networkError}
             </div>
-          </div>
-        )}
-      </div>
+          )}
+          {messages.map((m, idx) => (
+            <div
+              key={idx}
+              className={`chat-message chat-message-${m.role}`}
+            >
+              <div className="chat-bubble">{m.content}</div>
+            </div>
+          ))}
+          {loading && (
+            <div className="chat-message chat-message-assistant">
+              <div className="chat-bubble chat-bubble-loading">
+                Думаю над вашим запросом...
+              </div>
+            </div>
+          )}
+        </div>
 
-      <DialogExtras
-        context={dialogContext}
-        loading={loading}
-        onConfirmSearchPlan={confirmSearchPlan}
-        onSelectCandidate={selectCandidate}
-        onSubmitBooking={submitBooking}
-      />
+        <DialogExtras
+          context={dialogContext}
+          loading={loading}
+          onConfirmSearchPlan={confirmSearchPlan}
+          onSelectCandidate={selectCandidate}
+          onSubmitBooking={submitBooking}
+        />
+      </div>
 
       <div className="chat-input-row">
         <textarea
@@ -238,7 +240,7 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
             }
           }}
           placeholder="Опишите ваши предпочтения: кухня, бюджет, район, дата и время..."
-          rows={2}
+          rows={4}
         />
         <button
           className="chat-send"

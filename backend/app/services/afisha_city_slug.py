@@ -116,6 +116,41 @@ def _slugify_latin(s: str) -> str:
     return s.strip("-")
 
 
+# Human-readable city label for LLM / prompts (best-effort by Afisha slug).
+_SLUG_TO_DISPLAY: Dict[str, str] = {
+    "msk": "Москва",
+    "spb": "Санкт-Петербург",
+    "voronezh": "Воронеж",
+    "vladivostok": "Владивосток",
+    "rostov-na-donu": "Ростов-на-Дону",
+    "ekaterinburg": "Екатеринбург",
+    "novosibirsk": "Новосибирск",
+    "kazan": "Казань",
+    "samara": "Самара",
+    "ufa": "Уфа",
+    "krasnoyarsk": "Красноярск",
+    "omsk": "Омск",
+    "chelyabinsk": "Челябинск",
+    "krasnodar": "Краснодар",
+    "tula": "Тула",
+    "tver": "Тверь",
+    "sochi": "Сочи",
+    "irkutsk": "Иркутск",
+    "nnovgorod": "Нижний Новгород",
+    "kaliningrad": "Калининград",
+}
+
+
+def display_city_label_for_slug(city_slug: str) -> str:
+    """Return a short Russian city name for *city_slug* (Afisha path segment)."""
+    s = (city_slug or "").strip().lower()
+    if not s:
+        return "—"
+    if s in _SLUG_TO_DISPLAY:
+        return _SLUG_TO_DISPLAY[s]
+    return s.replace("-", " ").replace("_", " ").strip().title() or "—"
+
+
 def resolve_afisha_city_slug(city: Optional[str]) -> Optional[str]:
     """
     Return Afisha city path segment or None if *city* is empty after trim.

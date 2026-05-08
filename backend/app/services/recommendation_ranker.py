@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .cuisine_normalize import canonical_set_from_tags
 
+from .external_rating import rating_score_normalized
+
 
 def _safe_float(v: Any) -> Optional[float]:
     try:
@@ -106,12 +108,51 @@ def _cuisine_score(cand_tags: List[str], wanted: List[str], avoided: List[str]) 
     return 1.0
 
 
+def prefilter_candidates_by_cuisine(
+    candidates: List[Dict[str, Any]],
+    requirements: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Drop candidates that fail cuisine gate when user specified wanted or avoided cuisines.
+    If neither wanted nor avoided — keep all.
+    """
+    wanted = requirements.get("cuisine_wanted") or requirements.get("cuisines_wanted") or []
+    avoided = requirements.get("cuisine_avoid") or requirements.get("cuisines_avoid") or []
+    if not wanted and not avoided:
+        return list(candidates)
+    out: List[Dict[str, Any]] = []
+    for c in candidates:
+        tags = c.get("tags") or []
+        if not isinstance(tags, list):
+            tags = []
+        sc = _cuisine_score(
+            [str(x) for x in tags if x is not None],
+            [str(x) for x in wanted if isinstance(x, str)],
+            [str(x) for x in avoided if isinstance(x, str)],
+        )
+        if sc > 0:
+            out.append(c)
+    return out
+
+
+def _requirements_has_geo(requirements: Dict[str, Any]) -> bool:
+    loc = requirements.get("location")
+    if not isinstance(loc, dict):
+        return False
+    if loc.get("type") not in {"metro", "area"}:
+        return False
+    v = loc.get("value")
+    return isinstance(v, str) and bool(v.strip())
+
+
 @dataclass
 class RankedCandidate:
     candidate: Dict[str, Any]
     score: float
     budget_score: Optional[float]
     cuisine_score: Optional[float]
+    location_score: Optional[float]
+    external_rating_score: Optional[float]
     occasion_score: Optional[float]
     hard_pass: bool
     reasons: List[str]
@@ -188,14 +229,52 @@ def rank_candidates(
             if cuisine_score > 0:
                 reasons.append("Cuisine/tags match")
 
+        has_geo = _requirements_has_geo(requirements)
+        loc_raw = cand.get("geo_location_score")
+        if has_geo:
+            location_score: Optional[float] = (
+                float(loc_raw) if loc_raw is not None and _safe_float(loc_raw) is not None else 0.45
+            )
+        else:
+            location_score = None
+
+        ext = cand.get("external_rating")
+        ext_conf = cand.get("external_rating_confidence")
+        ext_f = _safe_float(ext) if ext is not None else None
+        ext_c = float(ext_conf) if ext_conf is not None and _safe_float(ext_conf) is not None else 0.0
+        external_rating_score = rating_score_normalized(ext_f, ext_c)
+        if external_rating_score is not None and external_rating_score > 0:
+            reasons.append("External rating signal")
+
         occ_score: Optional[float] = None
 
-        # Assemble weighted total using only known components (occasion excluded from search/rank).
-        components: List[Tuple[str, float, Optional[float]]] = [
-            ("budget", 0.53, budget_score),
-            ("cuisine", 0.47, cuisine_score),
-        ]
-        known = [c for c in components if c[2] is not None]
+        # Weighted composite: normalize over components with known values.
+        parts: List[Tuple[str, float, Optional[float]]] = [("cuisine", 0.35, float(cuisine_score))]
+        if budget_score is not None:
+            parts.append(("budget", 0.25, float(budget_score)))
+        if has_geo and location_score is not None:
+            parts.append(("location", 0.30, float(location_score)))
+        if external_rating_score is not None:
+            parts.append(("rating", 0.20, float(external_rating_score)))
+
+        if has_geo and external_rating_score is None:
+            # Redistribute rating weight into location when geo matters but no rating.
+            parts = [("cuisine", 0.30, float(cuisine_score))]
+            if budget_score is not None:
+                parts.append(("budget", 0.20, float(budget_score)))
+            if location_score is not None:
+                parts.append(("location", 0.50, float(location_score)))
+        elif not has_geo and external_rating_score is not None:
+            parts = [("cuisine", 0.40, float(cuisine_score))]
+            if budget_score is not None:
+                parts.append(("budget", 0.40, float(budget_score)))
+            parts.append(("rating", 0.20, float(external_rating_score)))
+        elif not has_geo and external_rating_score is None:
+            parts = [("cuisine", 0.47, float(cuisine_score))]
+            if budget_score is not None:
+                parts.append(("budget", 0.53, float(budget_score)))
+
+        known = [(n, w, v) for n, w, v in parts if v is not None]
         if hard_pass:
             total = 0.0
             scored.append(
@@ -204,6 +283,8 @@ def rank_candidates(
                     score=0.0,
                     budget_score=budget_score,
                     cuisine_score=cuisine_score,
+                    location_score=location_score,
+                    external_rating_score=external_rating_score,
                     occasion_score=occ_score,
                     hard_pass=True,
                     reasons=reasons + ["Hard pass"],
@@ -214,8 +295,8 @@ def rank_candidates(
         if not known:
             total = 0.0
         else:
-            weight_sum = sum(w for _, w, _v in known)
-            total = sum((w / weight_sum) * float(v) for _name, w, v in known if v is not None)
+            weight_sum = sum(w for _, w, _ in known)
+            total = sum((w / weight_sum) * float(v) for _name, w, v in known)
         total = max(0.0, min(1.0, float(total)))
 
         scored.append(
@@ -224,6 +305,8 @@ def rank_candidates(
                 score=total,
                 budget_score=budget_score,
                 cuisine_score=cuisine_score,
+                location_score=location_score,
+                external_rating_score=external_rating_score,
                 occasion_score=occ_score,
                 hard_pass=False,
                 reasons=reasons,
@@ -253,6 +336,8 @@ def rank_candidates(
                 "formal_score": s.score,
                 "budget_score": s.budget_score,
                 "cuisine_score": s.cuisine_score,
+                "location_score": s.location_score,
+                "external_rating_score": s.external_rating_score,
                 "occasion_score": s.occasion_score,
                 "hard_pass": s.hard_pass,
                 "reasons": s.reasons,

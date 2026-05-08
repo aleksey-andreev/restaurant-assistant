@@ -37,7 +37,6 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
   const bookingPending = Boolean(context?.booking_pending);
   const bookingComplete = Boolean(context?.booking_complete);
   const selected = context?.booking_selected_candidate;
-  const missing = context?.booking_missing_fields ?? [];
   const bookingReq = context?.booking_requirements;
   const reservation = context?.reservation_result;
 
@@ -61,9 +60,16 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
   }
 
   const showSearchPlanConfirm = needsSearchPlanConfirm(context);
+  const hasSelectedCandidate = Boolean(
+    selected &&
+      (
+        (typeof selected.url === "string" && selected.url.trim()) ||
+        (typeof selected.name === "string" && selected.name.trim())
+      )
+  );
 
   const showBooking =
-    bookingPending && !bookingComplete && list.length > 0;
+    bookingPending && !bookingComplete && list.length > 0 && hasSelectedCandidate;
   const showRecommendations = list.length > 0;
   const confirmation = {
     restaurantName:
@@ -199,11 +205,6 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
       {showBooking && (
         <form className="booking-form" onSubmit={handleBookingSubmit}>
           <div className="booking-form-title">Бронирование</div>
-          {missing.length > 0 && (
-            <p className="booking-form-hint">
-              Нужно: {missing.join(", ")}
-            </p>
-          )}
           <label className="booking-field">
             <span>Дата и время</span>
             <input

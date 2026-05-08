@@ -51,6 +51,7 @@ export type ReservationResult = {
 };
 
 export type DialogContext = {
+  booking_intent_mode?: "specific_restaurant" | "search" | null;
   final_recommendations?: RestaurantCandidate[];
   recommendations?: RestaurantCandidate[];
   shortlist?: RestaurantCandidate[];
@@ -66,6 +67,15 @@ export type DialogContext = {
   booking_missing_fields?: string[];
   booking_errors?: string[];
   reservation_result?: ReservationResult | null;
+  specific_restaurant_requirements?: {
+    name?: string | null;
+    city?: string | null;
+    city_slug?: string | null;
+    address_or_hint?: string | null;
+    source_url?: string | null;
+  };
+  specific_restaurant_missing_fields?: string[];
+  specific_restaurant_resolved?: boolean;
 };
 
 export type DialogStatePayload = {

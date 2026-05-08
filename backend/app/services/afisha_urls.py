@@ -20,6 +20,30 @@ def _path_has_restaurant(path: str) -> bool:
     return "/restaurant/" in (path or "")
 
 
+def _is_restaurant_card_path(path: str) -> bool:
+    """
+    Accept only canonical card-like paths:
+    /<city>/restaurant/<slug>/[optional trailing slash]
+    Reject common subpages like /reviews, /menu, etc.
+    """
+    p = (path or "").strip().rstrip("/")
+    if not p:
+        return False
+    parts = [x for x in p.split("/") if x]
+    # city + restaurant + slug
+    if len(parts) != 3:
+        return False
+    if parts[1] != "restaurant":
+        return False
+    slug = parts[2]
+    if not slug:
+        return False
+    forbidden = {"reviews", "review", "menu", "foto", "photo", "photos", "otzyvy"}
+    if slug.lower() in forbidden:
+        return False
+    return True
+
+
 def _canonical_afisha_card_url(path: str) -> str:
     p = path or ""
     if not p.startswith("/"):
@@ -47,6 +71,8 @@ def _normalize_direct_only(raw: str) -> Optional[str]:
 
     host = _host_lc(parsed.netloc)
     if not _is_afisha_host(host) or not _path_has_restaurant(parsed.path):
+        return None
+    if not _is_restaurant_card_path(parsed.path):
         return None
 
     return _canonical_afisha_card_url(parsed.path)

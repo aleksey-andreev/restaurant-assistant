@@ -47,7 +47,12 @@ def _decode_raw_data(raw_data_b64: str) -> str:
         raise YandexWebSearchError("Failed to decode rawData (base64)") from exc
 
 
-def _extract_urls_from_raw(raw_text: str, *, domain_allowlist: Optional[List[str]] = None) -> List[str]:
+def _extract_urls_from_raw(
+    raw_text: str,
+    *,
+    domain_allowlist: Optional[List[str]] = None,
+    require_afisha_host: bool = True,
+) -> List[str]:
     urls = re.findall(r"https?://[^\s\"'<>]+", raw_text)
     if not urls:
         return []
@@ -57,7 +62,7 @@ def _extract_urls_from_raw(raw_text: str, *, domain_allowlist: Optional[List[str
         if domain_allowlist:
             if not any(d in u for d in domain_allowlist):
                 continue
-        if "afisha.ru" not in u:
+        if require_afisha_host and "afisha.ru" not in u:
             continue
         out.append(u)
 
@@ -139,6 +144,48 @@ class YandexWebSearchClient:
                 return []
 
             raw_text = _decode_raw_data(raw_data_b64)
-            urls = _extract_urls_from_raw(raw_text, domain_allowlist=["afisha.ru"])
+            urls = _extract_urls_from_raw(
+                raw_text,
+                domain_allowlist=["afisha.ru"],
+                require_afisha_host=True,
+            )
             return urls[:max_docs]
+
+    async def search_raw_xml(self, query_text: str, *, page: int = 0) -> str:
+        """Decoded Yandex Search XML/HTML body (base64 rawData). For parsing snippets, not Afisha URL extraction."""
+        body: Dict[str, Any] = {
+            "query": {
+                "searchType": self._cfg.search_type,
+                "queryText": query_text,
+                "familyMode": self._cfg.family_mode,
+                "page": str(page),
+                "fixTypoMode": self._cfg.fix_typo_mode,
+            },
+            "sortSpec": {"sortMode": self._cfg.sort_mode, "sortOrder": self._cfg.sort_order},
+            "maxPassages": "2",
+            "folderId": self._cfg.folder_id,
+            "responseFormat": self._cfg.response_format,
+            "userAgent": self._cfg.user_agent,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            **_build_auth_header(self._cfg.api_key),
+        }
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
+            resp = await client.post(self._cfg.search_url, headers=headers, json=body)
+            if resp.status_code >= 400:
+                raise YandexWebSearchError(
+                    f"Yandex web search failed: status={resp.status_code} body={resp.text[:500]}"
+                )
+            payload = resp.json()
+            raw_data_b64 = payload.get("rawData")
+            if not raw_data_b64 or not isinstance(raw_data_b64, str):
+                raw_data_b64 = (
+                    payload.get("response", {}).get("rawData")
+                    if isinstance(payload.get("response"), dict)
+                    else None
+                )
+            if not raw_data_b64 or not isinstance(raw_data_b64, str):
+                return ""
+            return _decode_raw_data(raw_data_b64)
 

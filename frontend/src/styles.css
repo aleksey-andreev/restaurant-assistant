@@ -37,15 +37,31 @@
   box-sizing: border-box;
 }
 
+html {
+  height: 100%;
+}
+
 body {
   margin: 0;
+  min-height: 100%;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
   font-family: var(--font-base);
   background: radial-gradient(circle at 20% 0%, #fffaf6, #f5f5f2 45%);
   color: var(--text-primary);
 }
 
+#root {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .app-root {
-  min-height: 100vh;
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
 }
@@ -81,24 +97,24 @@ body {
 
 .app-main {
   flex: 1;
+  min-height: 0;
   display: flex;
+  flex-direction: column;
   padding: 0.85rem;
+  background: var(--bg-panel);
 }
 
 .chat-root {
   margin: 0 auto;
   width: 100%;
   max-width: 740px;
-  background: var(--bg-panel);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
-  padding: 0.9rem;
+  padding: 0.35rem 0 0;
   display: flex;
   flex-direction: column;
   gap: 0.7rem;
-  box-shadow: var(--shadow-md);
-  min-height: calc(100vh - 11.5rem);
-  padding-bottom: 0.9rem;
+  flex: 1;
+  min-height: 0;
+  padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));
 }
 
 .chat-toolbar {
@@ -146,11 +162,20 @@ body {
   line-height: 1;
 }
 
-.chat-messages {
-  flex: 1 1 auto;
+.chat-scroll-body {
+  flex: 1;
   min-height: 0;
-  max-height: none;
-  overflow: visible;
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.chat-messages {
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   gap: 0.65rem;
@@ -210,8 +235,8 @@ body {
   display: flex;
   gap: 0.55rem;
   align-items: center;
-  margin-top: auto;
-  padding: 0;
+  flex-shrink: 0;
+  margin-top: 0;
   border: none;
   border-radius: 0;
   background: transparent;
@@ -230,6 +255,11 @@ body {
   font-weight: 500;
   font-family: inherit;
   box-shadow: var(--shadow-sm);
+  line-height: 1.45;
+  /* Taller on narrow viewports so long placeholder wraps without inner scrollbar. */
+  min-height: clamp(6.75rem, 5.25rem + 10vmin, 9rem);
+  max-height: min(40vh, 13rem);
+  overflow-y: auto;
 }
 
 .chat-input::placeholder {
@@ -578,16 +608,8 @@ body {
   }
 
   .chat-root {
-    padding: 1.1rem;
-    min-height: calc(100vh - 12.5rem);
-  }
-
-  .chat-messages {
-    max-height: none;
-  }
-
-  .chat-input-row {
-    margin-top: auto;
+    padding-top: 0.25rem;
+    padding-bottom: calc(0.65rem + env(safe-area-inset-bottom, 0px));
   }
 }
 

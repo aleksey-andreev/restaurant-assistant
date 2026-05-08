@@ -113,6 +113,15 @@ def _extract_open_now(full_text: str) -> Dict[str, Any]:
     return {"is_open_now": None, "raw": None}
 
 
+def _yes_no_token(s: str) -> Optional[bool]:
+    t = s.strip().lower()
+    if t in {"есть", "да", "yes", "true", "✓", "√"}:
+        return True
+    if t in {"нет", "no", "false"}:
+        return False
+    return None
+
+
 def _extract_flags(full_text: str) -> Dict[str, Optional[bool]]:
     flags: Dict[str, Optional[bool]] = {
         "delivery": None,
@@ -121,24 +130,109 @@ def _extract_flags(full_text: str) -> Dict[str, Optional[bool]]:
         "banquets": None,
         "breakfast": None,
         "business_lunch": None,
+        "terrace": None,
+        "wifi": None,
+        "kids_menu": None,
+        "kids_room": None,
     }
 
-    # Afisha cards often use "Доставка Есть/Нет" as separate lines.
+    # Afisha: "Парковка Есть", "Банкеты: Нет", "Банкет — Да", etc.
     mapping = {
         "Доставка": "delivery",
         "Парковка": "parking",
         "Кейтеринг": "catering",
         "Банкеты": "banquets",
+        "Банкет": "banquets",
         "Завтраки": "breakfast",
         "Бизнес-ланч": "business_lunch",
+        "Терраса": "terrace",
+        "Wi-Fi": "wifi",
+        "Wi Fi": "wifi",
+        "Детское меню": "kids_menu",
+        "Детская комната": "kids_room",
     }
 
     for ru_label, key in mapping.items():
-        # capture small window after label
-        m = re.search(rf"{re.escape(ru_label)}\s*(Есть|Нет)", full_text)
+        m = re.search(
+            rf"{re.escape(ru_label)}\s*[:\s\-–—]*\s*(Есть|Нет|Да)",
+            full_text,
+            re.IGNORECASE,
+        )
         if m:
-            flags[key] = True if m.group(1) == "Есть" else False
+            flags[key] = _yes_no_token(m.group(1))
     return flags
+
+
+def _one_line(s: Any, max_len: int = 4000) -> Optional[str]:
+    if not isinstance(s, str):
+        return None
+    t = _norm_space(s)
+    if not t:
+        return None
+    return t[:max_len]
+
+
+def _extract_card_extras_from_ld(ld: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Structured fields from schema.org Restaurant JSON-LD (no metro)."""
+    if not isinstance(ld, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    tel = ld.get("telephone")
+    if isinstance(tel, list):
+        tel = tel[0] if tel else None
+    if isinstance(tel, str) and tel.strip():
+        out["telephone"] = tel.strip()[:128]
+
+    url = ld.get("url")
+    if isinstance(url, str) and url.strip():
+        out["url"] = url.strip()[:768]
+
+    desc = _one_line(ld.get("description"), 8000)
+    if desc:
+        out["description"] = desc
+
+    img = ld.get("image")
+    if isinstance(img, str) and img.strip():
+        out["image"] = img.strip()[:768]
+    elif isinstance(img, list) and img:
+        first = img[0]
+        if isinstance(first, str) and first.strip():
+            out["image"] = first.strip()[:768]
+        elif isinstance(first, dict) and isinstance(first.get("url"), str):
+            out["image"] = str(first["url"]).strip()[:768]
+
+    oh = ld.get("openingHoursSpecification")
+    if oh is not None:
+        out["opening_hours_spec"] = oh
+
+    same = ld.get("sameAs")
+    if isinstance(same, str) and same.strip():
+        out["same_as"] = same.strip()[:768]
+    elif isinstance(same, list) and same:
+        out["same_as"] = [str(x).strip() for x in same[:5] if isinstance(x, str) and x.strip()]
+
+    ar = ld.get("aggregateRating")
+    if isinstance(ar, dict):
+        rv_raw = ar.get("ratingValue")
+        val: Optional[float] = None
+        if rv_raw is not None:
+            try:
+                v = float(str(rv_raw).strip().replace(",", "."))
+                if 1.0 <= v <= 5.0:
+                    val = v
+            except (TypeError, ValueError):
+                pass
+        if val is not None:
+            rc_raw = ar.get("reviewCount") or ar.get("ratingCount")
+            rc_int: Optional[int] = None
+            if rc_raw is not None:
+                try:
+                    rc_int = int(float(str(rc_raw).replace(" ", "")))
+                except (TypeError, ValueError):
+                    rc_int = None
+            out["aggregate_rating"] = {"rating_value": val, "review_count": rc_int}
+
+    return {"from_ld": out} if out else {}
 
 
 def _extract_tags(soup: BeautifulSoup) -> List[str]:
@@ -251,30 +345,28 @@ def parse_afisha_restaurant_card(html: str, url: str) -> Dict[str, Any]:
         m_city = re.search(r"(Москва, [^О]+Посмотреть на карту)", full_text)
         if m_city:
             address = _norm_space(m_city.group(1).replace("Посмотреть на карту", "")).strip(" ,")
-
-    metro = None
-    m_metro = re.search(r"\b([А-ЯA-Z][а-яa-z\- ]{2,30})\b\s*Посмотреть на карту", full_text)
-    if m_metro:
-        metro = _norm_space(m_metro.group(1))
-    if not metro and ld and isinstance(ld.get("address"), dict):
-        sa = ld["address"].get("streetAddress")
-        if isinstance(sa, str) and "," in sa:
-            metro = _norm_space(sa.split(",")[0])
-        elif isinstance(sa, str) and sa.strip():
-            metro = _norm_space(sa)
+    if not address:
+        m_spb = re.search(
+            r"(Санкт-Петербург, [^\n]+?)(?:\s*Посмотреть на карту|$)",
+            full_text,
+        )
+        if m_spb:
+            address = _norm_space(m_spb.group(1)).strip(" ,")
 
     venue_closed = _venue_marked_closed(full_text)
+    card_extras = _extract_card_extras_from_ld(ld)
 
     return {
         "url": url,
         "name": name,
         "address": address,
-        "metro": metro,
+        "metro": None,
         "avg_check": avg_check,
         "open_now": open_now,
         "venue_closed": venue_closed,
         "flags": flags,
         "tags": tags,
+        "card_extras": card_extras if card_extras else None,
         # raw text is useful for debug/LLM but keep it out of scoring by default
         "debug": {"has_full_text": bool(full_text), "full_text_len": len(full_text)},
     }

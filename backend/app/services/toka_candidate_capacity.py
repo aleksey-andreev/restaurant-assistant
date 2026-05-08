@@ -1,13 +1,10 @@
 """
-Toka capacity gate for Afisha candidates: stub resolver + halls/tables check.
-
-Until Afisha→Toka search exists, TOKA_STUB_ORGANIZATION_ID and TOKA_STUB_STORE_ID
-must point at the test account's org and store (see .cursor/rules).
+Toka capacity gate for Afisha candidates: resolver reads org/store + tokens from table
+toka_restaurant_bindings (fallback row restaurant_name=default).
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from .toka_gateway import TokaGatewayError, get_toka_gateway
@@ -15,26 +12,39 @@ from .toka_gateway import TokaGatewayError, get_toka_gateway
 # Demote formal_score when capacity could not be verified (stub/env/API).
 TOKA_UNVERIFIED_SCORE_FACTOR = 0.85
 
-_MSG_NO_ENV = (
-    "Не удалось подтвердить стол: задайте TOKA_STUB_ORGANIZATION_ID и TOKA_STUB_STORE_ID "
-    "(org и store тестового аккаунта Toka)."
+_MSG_NO_DB = (
+    "Не удалось подтвердить стол: нет записи Toka в БД для этого ресторана "
+    "(или отсутствует строка default в toka_restaurant_bindings)."
 )
 _MSG_API = "Не удалось подтвердить наличие стола в системе бронирования (ошибка Toka)."
 _MSG_TOO_SMALL = "В тестовой точке Toka нет стола на заявленное число гостей."
 
 
-def resolve_toka_store_stub(name: str, address: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Placeholder for future Afisha→Toka resolver. Accepts name/address for stable call sites.
+async def resolve_toka_store_stub_async(name: str, address: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve org_id/store_id from toka_restaurant_bindings by restaurant name, else default row."""
+    _ = address
 
-    Returns (organization_id, store_id) from environment or (None, None).
-    """
-    _ = (name, address)
-    org = os.environ.get("TOKA_STUB_ORGANIZATION_ID", "").strip()
-    store = os.environ.get("TOKA_STUB_STORE_ID", "").strip()
-    if not org or not store:
-        return None, None
-    return org, store
+    def _sync():
+        from ..storage.database import get_session_maker
+        from ..storage.toka_binding_repository import TokaBindingRepository, norm_toka_restaurant_key
+
+        sm = get_session_maker()
+        sess = sm()
+        try:
+            repo = TokaBindingRepository(sess)
+            nk = norm_toka_restaurant_key(name)
+            row = repo.resolve_binding(restaurant_name_key=nk)
+            if row is None:
+                return None, None
+            o = row.org_id.strip()
+            s = row.store_id.strip()
+            if not o or not s:
+                return None, None
+            return o, s
+        finally:
+            sess.close()
+
+    return await asyncio.to_thread(_sync)
 
 
 async def apply_toka_capacity_gate(
@@ -66,10 +76,10 @@ async def apply_toka_capacity_gate(
     name0 = str(candidates[0].get("name") or "")
     addr0 = candidates[0].get("address")
     addr_s = str(addr0).strip() if addr0 else None
-    org_id, store_id = resolve_toka_store_stub(name0, addr_s)
+    org_id, store_id = await resolve_toka_store_stub_async(name0, addr_s)
 
     if org_id is None or store_id is None:
-        return _annotate_all(_MSG_NO_ENV, None), errors
+        return _annotate_all(_MSG_NO_DB, None), errors
 
     try:
         gateway = await get_toka_gateway()

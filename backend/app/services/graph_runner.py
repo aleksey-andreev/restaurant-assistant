@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,6 +12,10 @@ from langgraph.graph import END, StateGraph
 
 from ..services.afisha_city_slug import resolve_afisha_city_slug
 from ..services.llm import LLMClientRegistry
+from ..storage.afisha_catalog_repository import (
+    AfishaCatalogRepository,
+    catalog_entry_to_candidate,
+)
 from ..storage.session_store import SessionStore
 from ..storage.state_repository import StateRepository
 
@@ -78,7 +84,7 @@ def format_search_plan_summary(req: Dict[str, Any]) -> str:
     if isinstance(loc, dict) and loc.get("type") in {"metro", "area"}:
         lv = loc.get("value")
         if isinstance(lv, str) and lv.strip():
-            loc_s = f"{loc.get('type')}: {lv.strip()}"
+            loc_s = f"{_location_type_label_ru(loc.get('type'))}: {lv.strip()}"
         else:
             loc_s = "весь город (без привязки к метро/району)"
     elif isinstance(loc, dict) and loc.get("type") == "none":
@@ -115,6 +121,44 @@ def _fmt_money(v: float) -> str:
     return f"{v:.0f}"
 
 
+def _location_type_label_ru(loc_type: Any) -> str:
+    """User-facing label for recommendation_requirements.location.type."""
+    if loc_type == "metro":
+        return "метро"
+    if loc_type == "area":
+        return "район"
+    return str(loc_type) if loc_type not in (None, "") else "—"
+
+
+def _contains_any(text: str, parts: List[str]) -> bool:
+    t = text.lower()
+    return any(p in t for p in parts)
+
+
+def detect_specific_booking_intent(last_user_text: str) -> bool:
+    """
+    Conservative heuristic for direct booking intent.
+    """
+    text = (last_user_text or "").strip().lower()
+    if not text:
+        return False
+    has_booking_word = _contains_any(
+        text,
+        ["заброни", "бронь", "бронь стол", "резерв", "зарезерв", "столик"],
+    )
+    if not has_booking_word:
+        return False
+    has_specific_marker = _contains_any(
+        text,
+        ["в ресторане", "в ", "ресторан ", "кафе ", "бар ", "\""],
+    )
+    has_search_marker = _contains_any(
+        text,
+        ["подбери", "найди варианты", "посоветуй", "по критериям", "лучшие"],
+    )
+    return has_specific_marker and not has_search_marker
+
+
 class RecState(TypedDict, total=False):
     session_id: str
     current_node: str
@@ -127,6 +171,7 @@ class RecState(TypedDict, total=False):
     # yandex
     yandex_queries: List[str]
     yandex_urls: List[str]
+    catalog_entries: List[Dict[str, Any]]
     # candidates
     candidates: List[Dict[str, Any]]
     # ranking
@@ -157,6 +202,11 @@ class RecState(TypedDict, total=False):
     requirements_prompt_count: int
     # analytics: append-only events persisted in graph_state.context
     pipeline_trace: List[Dict[str, Any]]
+    # intent: direct booking of a specific restaurant
+    booking_intent_mode: Optional[str]
+    specific_restaurant_requirements: Dict[str, Any]
+    specific_restaurant_missing_fields: List[str]
+    specific_restaurant_resolved: bool
 
 
 @dataclass
@@ -173,6 +223,7 @@ class GraphRunner:
     session_store: SessionStore
     state_repository: StateRepository
     llm_registry: LLMClientRegistry
+    afisha_catalog_repository: Optional[AfishaCatalogRepository] = None
 
     async def run_dialog(
         self,
@@ -253,6 +304,7 @@ class GraphRunner:
             }
 
         llm_client, system_prompt, node_params = self.llm_registry.get_default_node()
+        catalog_repo = self.afisha_catalog_repository
 
         def _trace_append(state: RecState, stage: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             tr: List[Dict[str, Any]] = list(state.get("pipeline_trace") or [])
@@ -752,13 +804,249 @@ class GraphRunner:
             )
             return state
 
+        async def detect_booking_intent_node(state: RecState) -> RecState:
+            if bool(state.get("booking_pending")):
+                return {
+                    **state,
+                    "current_node": "detect_booking_intent",
+                    "pipeline_trace": _trace_append(
+                        state,
+                        "detect_booking_intent",
+                        {"intent_mode": state.get("booking_intent_mode") or "booking_pending"},
+                    ),
+                }
+
+            mode = state.get("booking_intent_mode")
+            if mode not in {"specific_restaurant", "search"}:
+                mode = "search"
+            last_text = _last_user_text()
+            if detect_specific_booking_intent(last_text):
+                mode = "specific_restaurant"
+            elif _contains_any(last_text.lower(), ["подбери", "найди варианты", "посоветуй", "по критериям"]):
+                mode = "search"
+            elif mode != "specific_restaurant":
+                mode = "search"
+            return {
+                **state,
+                "current_node": "detect_booking_intent",
+                "booking_intent_mode": mode,
+                "pipeline_trace": _trace_append(
+                    state,
+                    "detect_booking_intent",
+                    {"intent_mode": mode},
+                ),
+            }
+
+        async def extract_specific_restaurant_requirements_node(state: RecState) -> RecState:
+            prev = dict(state.get("specific_restaurant_requirements") or {})
+            missing_prev = list(state.get("specific_restaurant_missing_fields") or [])
+
+            prompt_sys = (
+                "Извлеки параметры брони конкретного ресторана из сообщения пользователя. "
+                "Верни только JSON без markdown."
+            )
+            prompt_user = (
+                "Верни JSON формата:\n"
+                "{\n"
+                '  "name": string|null,\n'
+                '  "city": string|null,\n'
+                '  "address_or_hint": string|null,\n'
+                '  "source_url": string|null\n'
+                "}\n\n"
+                f"Последнее сообщение пользователя:\n{_last_user_text()}\n\n"
+                f"Ранее сохранённые значения: {json.dumps(prev, ensure_ascii=False)}\n"
+                "Если поле не указано явно, ставь null."
+            )
+            parsed: Dict[str, Any] = {}
+            try:
+                raw = await llm_client.chat(
+                    messages=[
+                        {"role": "system", "content": prompt_sys},
+                        {"role": "user", "content": prompt_user},
+                    ],
+                    **{**node_params, "response_format": {"type": "json_object"}},
+                )
+                js = raw
+                s = js.find("{")
+                e = js.rfind("}")
+                if s >= 0 and e > s:
+                    js = js[s : e + 1]
+                payload = json.loads(js)
+                if isinstance(payload, dict):
+                    parsed = payload
+            except Exception:
+                parsed = {}
+
+            name = parsed.get("name")
+            city = parsed.get("city")
+            hint = parsed.get("address_or_hint")
+            url = parsed.get("source_url")
+            name_out = name.strip() if isinstance(name, str) and name.strip() else (
+                prev.get("name").strip() if isinstance(prev.get("name"), str) and prev.get("name").strip() else None
+            )
+            city_out = city.strip() if isinstance(city, str) and city.strip() else (
+                prev.get("city").strip() if isinstance(prev.get("city"), str) and prev.get("city").strip() else None
+            )
+            hint_out = hint.strip() if isinstance(hint, str) and hint.strip() else (
+                prev.get("address_or_hint").strip()
+                if isinstance(prev.get("address_or_hint"), str) and prev.get("address_or_hint").strip()
+                else None
+            )
+            url_out = url.strip() if isinstance(url, str) and url.strip() else (
+                prev.get("source_url").strip()
+                if isinstance(prev.get("source_url"), str) and prev.get("source_url").strip()
+                else None
+            )
+            city_slug = resolve_afisha_city_slug(city_out)
+            req = {
+                "name": name_out,
+                "city": city_out,
+                "city_slug": city_slug,
+                "address_or_hint": hint_out,
+                "source_url": url_out,
+            }
+            missing: List[str] = []
+            if not name_out:
+                missing.append("name")
+            if not city_out:
+                missing.append("city")
+
+            return {
+                **state,
+                "current_node": "extract_specific_restaurant",
+                "specific_restaurant_requirements": req,
+                "specific_restaurant_missing_fields": missing,
+                "specific_restaurant_resolved": False,
+                "pipeline_trace": _trace_append(
+                    state,
+                    "extract_specific_restaurant",
+                    {"missing_fields": missing, "repeated_missing": [x for x in missing if x in set(missing_prev)]},
+                ),
+            }
+
+        async def ask_specific_restaurant_questions_node(state: RecState) -> RecState:
+            missing = [str(x) for x in (state.get("specific_restaurant_missing_fields") or []) if isinstance(x, str)]
+            labels = {
+                "name": "название ресторана",
+                "city": "город",
+            }
+            lines = "\n".join(f"- {labels.get(x, x)}" for x in missing) or "- название ресторана\n- город"
+            reply = (
+                "Для бронирования конкретного ресторана нужно уточнить:\n"
+                f"{lines}\n\n"
+                "Можно ответить одним сообщением. Если есть неоднозначность, добавьте адрес/район."
+            )
+            return {
+                **state,
+                "current_node": "ask_specific_restaurant_questions",
+                "reply": reply,
+                "pipeline_trace": _trace_append(
+                    state,
+                    "ask_specific_restaurant_questions",
+                    {"missing_fields": missing},
+                ),
+            }
+
+        async def resolve_specific_restaurant_node(state: RecState) -> RecState:
+            from .toka_specific_restaurant_resolver import resolve_specific_restaurant_candidates
+
+            req = dict(state.get("specific_restaurant_requirements") or {})
+            name = str(req.get("name") or "").strip()
+            city_slug = str(req.get("city_slug") or "").strip()
+            hint = str(req.get("address_or_hint") or "").strip()
+            if not name or not city_slug:
+                return {
+                    **state,
+                    "current_node": "resolve_specific_restaurant",
+                    "specific_restaurant_resolved": False,
+                    "pipeline_trace": _trace_append(
+                        state,
+                        "resolve_specific_restaurant",
+                        {"status": "invalid_requirements"},
+                    ),
+                }
+
+            resolved = await resolve_specific_restaurant_candidates(
+                city_slug=city_slug,
+                restaurant_name=name,
+                address_hint=hint,
+                city_label=str(req.get("city") or "").strip() or city_slug,
+                llm_chat=llm_client.chat,
+                llm_node_params=dict(node_params),
+            )
+            status = str(resolved.get("status") or "")
+            candidates = [x for x in (resolved.get("candidates") or []) if isinstance(x, dict)]
+            selected = resolved.get("selected") if isinstance(resolved.get("selected"), dict) else None
+            errors = list(state.get("service_errors") or [])
+            errors.extend([str(x) for x in (resolved.get("errors") or []) if str(x).strip()])
+
+            if status == "resolved" and selected is not None:
+                return {
+                    **state,
+                    "current_node": "resolve_specific_restaurant",
+                    "reply": "Нашёл нужный ресторан. Заполните форму бронирования ниже и нажмите «Отправить заявку».",
+                    "booking_pending": True,
+                    "booking_selected_candidate": selected,
+                    "booking_complete": False,
+                    "booking_missing_fields": ["starts_at", "guest_count", "guest_name", "guest_phone"],
+                    "booking_errors": [],
+                    "specific_restaurant_resolved": True,
+                    "final_recommendations": [selected],
+                    "recommendations": [selected],
+                    "shortlist": [selected],
+                    "service_errors": errors,
+                    "pipeline_trace": _trace_append(
+                        state,
+                        "resolve_specific_restaurant",
+                        {"status": status, "candidate_count": 1},
+                    ),
+                }
+
+            if status == "ambiguous" and candidates:
+                return {
+                    **state,
+                    "current_node": "resolve_specific_restaurant",
+                    "reply": (
+                        "Нашёл несколько похожих ресторанов. "
+                        "Выберите нужный вариант в карточках ниже, и затем заполните форму бронирования."
+                    ),
+                    "booking_pending": True,
+                    "booking_selected_candidate": {},
+                    "booking_complete": False,
+                    "booking_missing_fields": ["starts_at", "guest_count", "guest_name", "guest_phone"],
+                    "booking_errors": [],
+                    "specific_restaurant_resolved": False,
+                    "final_recommendations": candidates,
+                    "recommendations": candidates,
+                    "shortlist": candidates,
+                    "service_errors": errors,
+                    "pipeline_trace": _trace_append(
+                        state,
+                        "resolve_specific_restaurant",
+                        {"status": status, "candidate_count": len(candidates)},
+                    ),
+                }
+
+            return {
+                **state,
+                "current_node": "resolve_specific_restaurant",
+                "reply": (
+                    "Не удалось однозначно найти этот ресторан. "
+                    "Уточните, пожалуйста, адрес/район или пришлите ссылку на карточку."
+                ),
+                "specific_restaurant_resolved": False,
+                "service_errors": errors,
+                "pipeline_trace": _trace_append(
+                    state,
+                    "resolve_specific_restaurant",
+                    {"status": status or "not_found", "candidate_count": len(candidates)},
+                ),
+            }
+
         async def build_yandex_queries_node(state: RecState) -> RecState:
             req = state.get("recommendation_requirements") or {}
             city_slug = (req.get("city_slug") or "").strip() if isinstance(req.get("city_slug"), str) else ""
             city = req.get("city") or ""
-            location = req.get("location") or {}
-            loc_type = location.get("type") if isinstance(location, dict) else None
-            loc_val = location.get("value") if isinstance(location, dict) else None
 
             cuisine_terms = []
             for x in (req.get("cuisine_wanted") or [])[:3]:
@@ -766,7 +1054,6 @@ class GraphRunner:
                     cuisine_terms.append(str(x))
             cuisine_part = " ".join(cuisine_terms) if cuisine_terms else ""
 
-            loc_part = f"\"{loc_val}\"" if loc_val else ""
             if not city_slug:
                 return {
                     **state,
@@ -784,13 +1071,13 @@ class GraphRunner:
                     ),
                 }
 
-            # Prefer restaurant-card pages containing метро names in heading.
+            # Metro/area are not passed into SERP — geo is applied post-fetch (LLM on address).
             base = f"site:afisha.ru {city_slug}/restaurant"
 
-            q1 = " ".join([base, loc_part, cuisine_part]).strip()
-            q2 = " ".join([base, loc_part, "Средний чек", cuisine_part]).strip()
-            q3 = " ".join([base, loc_part, "Открыто", cuisine_part]).strip()
-            q4 = " ".join([base, loc_part, "ресторан", cuisine_part]).strip()
+            q1 = " ".join([base, cuisine_part]).strip()
+            q2 = " ".join([base, "Средний чек", cuisine_part]).strip()
+            q3 = " ".join([base, "Открыто", cuisine_part]).strip()
+            q4 = " ".join([base, "ресторан", cuisine_part]).strip()
 
             queries = [q for q in [q1, q2, q3, q4] if len(q) >= 10]
             # dedupe preserve order
@@ -866,27 +1153,62 @@ class GraphRunner:
                 ),
             }
 
-        async def fetch_afisha_cards_node(state: RecState) -> RecState:
-            from .afisha_parser import fetch_and_parse_afisha_card
-            from .afisha_urls import filter_and_order_afisha_restaurant_urls
+        async def load_afisha_candidate_urls_node(state: RecState) -> RecState:
+            """
+            Load only prefetch-ready rows from PostgreSQL catalog.
+            """
+            req = state.get("recommendation_requirements") or {}
+            city_slug = (req.get("city_slug") or "").strip() if isinstance(req.get("city_slug"), str) else ""
+            limit = int(os.environ.get("AFISHA_CATALOG_LIST_LIMIT", "8000"))
+            urls: List[str] = []
+            catalog_entries: List[Dict[str, Any]] = []
+            source = "none"
+            if catalog_repo is not None and city_slug:
+                catalog_entries_all = await asyncio.to_thread(
+                    catalog_repo.list_prefetch_ready_rows_for_city, city_slug, limit=limit
+                )
+                catalog_entries = [
+                    r for r in catalog_entries_all if not bool((r or {}).get("venue_closed"))
+                ]
+                urls = [r["url"] for r in catalog_entries]
+                if urls:
+                    source = "catalog_prefetch"
+            return {
+                **state,
+                "yandex_queries": [],
+                "yandex_urls": urls,
+                "catalog_entries": catalog_entries,
+                "current_node": "load_afisha_candidate_urls",
+                "pipeline_trace": _trace_append(
+                    state,
+                    "load_afisha_candidate_urls",
+                    {
+                        "source": source,
+                        "url_count": len(urls),
+                        "catalog_prefetch_rows": len(catalog_entries),
+                        "catalog_closed_filtered": (
+                            (len(catalog_entries_all) - len(catalog_entries))
+                            if "catalog_entries_all" in locals()
+                            else 0
+                        ),
+                        "city_slug": city_slug,
+                    },
+                ),
+            }
 
+        async def fetch_afisha_cards_node(state: RecState) -> RecState:
             candidates: List[Dict[str, Any]] = []
-            skipped_closed = 0
-            urls = filter_and_order_afisha_restaurant_urls(list(state.get("yandex_urls") or []))[
-                :30
-            ]
-            for url in urls:
-                try:
-                    cand = await fetch_and_parse_afisha_card(url)
-                    # basic sanity
-                    if not cand.get("name") and not cand.get("metro"):
+            catalog_entries = state.get("catalog_entries") or []
+            if isinstance(catalog_entries, list):
+                for row in catalog_entries:
+                    if not isinstance(row, dict):
                         continue
-                    if cand.get("venue_closed"):
-                        skipped_closed += 1
+                    if bool(row.get("venue_closed")):
                         continue
-                    candidates.append(cand)
-                except Exception:
-                    continue
+                    try:
+                        candidates.append(catalog_entry_to_candidate(row))
+                    except Exception:
+                        continue
             return {
                 **state,
                 "current_node": "fetch_afisha_cards",
@@ -896,9 +1218,294 @@ class GraphRunner:
                     "fetch_afisha_cards",
                     {
                         "candidate_count": len(candidates),
-                        "skipped_closed": skipped_closed,
+                        "skipped_closed": 0,
                         "names": [c.get("name") for c in candidates[:10]],
                     },
+                ),
+            }
+
+        async def cuisine_prefilter_node(state: RecState) -> RecState:
+            from .recommendation_ranker import prefilter_candidates_by_cuisine
+
+            req = state.get("recommendation_requirements") or {}
+            cands = list(state.get("candidates") or [])
+            filtered = prefilter_candidates_by_cuisine(cands, req if isinstance(req, dict) else {})
+            return {
+                **state,
+                "current_node": "cuisine_prefilter",
+                "candidates": filtered,
+                "pipeline_trace": _trace_append(
+                    state,
+                    "cuisine_prefilter",
+                    {"in_count": len(cands), "out_count": len(filtered)},
+                ),
+            }
+
+        async def geo_gate_node(state: RecState) -> RecState:
+            import re
+
+            def _norm_token(v: Any) -> str:
+                if not isinstance(v, str):
+                    return ""
+                return re.sub(r"\s+", " ", v.strip().lower())
+
+            async def _normalize_area_from_user(req_loc: Dict[str, Any], city_slug: str) -> Optional[str]:
+                raw = req_loc.get("value")
+                if not isinstance(raw, str) or not raw.strip():
+                    return None
+                raw_norm = _norm_token(raw).replace(" р-н", " район")
+                rows = []
+                if catalog_repo is not None and city_slug:
+                    rows = await asyncio.to_thread(catalog_repo.list_city_districts, city_slug)
+                norm_to_label: Dict[str, str] = {}
+                for r in rows:
+                    n = _norm_token(r.get("district_norm"))
+                    if n:
+                        norm_to_label[n] = str(r.get("district_label") or "").strip()
+                if raw_norm in norm_to_label:
+                    return norm_to_label[raw_norm]
+                if raw_norm and not raw_norm.endswith("район"):
+                    raw_try = f"{raw_norm} район"
+                    if raw_try in norm_to_label:
+                        return norm_to_label[raw_try]
+                if not norm_to_label:
+                    return None
+                options = sorted(norm_to_label.keys())
+                prompt = (
+                    "Нормализуй пользовательский район к одному из допустимых значений.\n"
+                    f"Ввод: {raw.strip()}\n"
+                    f"Допустимые значения: {options}\n"
+                    "Ответ только JSON вида {\"district_norm\": string|null}."
+                )
+                try:
+                    raw_llm = await llm_client.chat(
+                        [{"role": "user", "content": prompt}],
+                        **dict(node_params),
+                    )
+                    s = (raw_llm or "").strip()
+                    st = s.find("{")
+                    en = s.rfind("}")
+                    if st < 0 or en <= st:
+                        return None
+                    payload = json.loads(s[st : en + 1])
+                    chosen = _norm_token(payload.get("district_norm")) if isinstance(payload, dict) else ""
+                    if chosen in norm_to_label:
+                        return norm_to_label[chosen]
+                except Exception:
+                    return None
+                return None
+
+            cands = list(state.get("candidates") or [])
+            req = state.get("recommendation_requirements") or {}
+            loc = req.get("location") if isinstance(req, dict) else {}
+            city_slug = str(req.get("city_slug") or "").strip() if isinstance(req, dict) else ""
+            if not isinstance(loc, dict):
+                loc = {}
+            loc_t = loc.get("type")
+            loc_v = loc.get("value")
+
+            if loc_t not in {"metro", "area"} or not isinstance(loc_v, str) or not loc_v.strip():
+                kept = []
+                for c in cands:
+                    d = dict(c)
+                    d["llm_geo_result"] = "match"
+                    d["geo_location_score"] = 1.0
+                    kept.append(d)
+                return {
+                    **state,
+                    "current_node": "geo_gate",
+                    "candidates": kept,
+                    "pipeline_trace": _trace_append(
+                        state,
+                        "geo_gate",
+                        {"in_count": len(cands), "out_count": len(kept), "dropped_geo_mismatch": 0},
+                    ),
+                }
+
+            want_norm = _norm_token(loc_v)
+            want_area_label = None
+            if loc_t == "area":
+                want_area_label = await _normalize_area_from_user(loc, city_slug)
+                if not want_area_label:
+                    kept = []
+                    return {
+                        **state,
+                        "current_node": "geo_gate",
+                        "candidates": kept,
+                        "pipeline_trace": _trace_append(
+                            state,
+                            "geo_gate",
+                            {
+                                "in_count": len(cands),
+                                "out_count": 0,
+                                "dropped_geo_mismatch": len(cands),
+                                "user_area_unresolved": str(loc_v),
+                            },
+                        ),
+                    }
+
+            kept = []
+            dropped = 0
+            for c in cands:
+                d = dict(c)
+                ok = False
+                if loc_t == "area":
+                    area_norm = _norm_token(d.get("geo_inferred_area"))
+                    ok = area_norm == _norm_token(want_area_label)
+                elif loc_t == "metro":
+                    metros = d.get("geo_osm_metros")
+                    metro_norms = (
+                        {_norm_token(x) for x in metros if isinstance(x, str) and x.strip()}
+                        if isinstance(metros, list)
+                        else set()
+                    )
+                    ok = want_norm in metro_norms
+                if ok:
+                    d["llm_geo_result"] = "match"
+                    d["geo_location_score"] = 1.0
+                    kept.append(d)
+                else:
+                    dropped += 1
+            return {
+                **state,
+                "current_node": "geo_gate",
+                "candidates": kept,
+                "pipeline_trace": _trace_append(
+                    state,
+                    "geo_gate",
+                    {
+                        "in_count": len(cands),
+                        "out_count": len(kept),
+                        "dropped_geo_mismatch": dropped,
+                        "location_type": loc_t,
+                        "location_value": loc_v,
+                        "normalized_area": want_area_label,
+                    },
+                ),
+            }
+
+        async def external_rating_node(state: RecState) -> RecState:
+            from .external_rating import (
+                catalog_aggregate_rating_score,
+                enrich_candidate_external_rating,
+                external_rating_use_yandex,
+                stored_yandex_rating_from_catalog,
+            )
+            from .yandex_web_search import YandexWebSearchClient
+
+            req = state.get("recommendation_requirements") or {}
+            city = str(req.get("city") or "").strip()
+            max_n = int(os.environ.get("EXTERNAL_RATING_MAX_CANDIDATES", "20"))
+            all_cands = list(state.get("candidates") or [])
+            head, tail = all_cands[:max_n], all_cands[max_n:]
+            errors = list(state.get("service_errors") or [])
+            use_yandex_serp = external_rating_use_yandex()
+            rating_enabled = os.environ.get("EXTERNAL_RATING_SCORING_ENABLED", "1").strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+
+            if not rating_enabled:
+                out_disabled: List[Dict[str, Any]] = []
+                for c in all_cands:
+                    d = dict(c)
+                    d["external_rating"] = None
+                    d["external_rating_confidence"] = 0.0
+                    out_disabled.append(d)
+                return {
+                    **state,
+                    "current_node": "external_rating",
+                    "candidates": out_disabled,
+                    "service_errors": errors,
+                    "pipeline_trace": _trace_append(
+                        state,
+                        "external_rating",
+                        {
+                            "candidate_count": len(out_disabled),
+                            "rating_enabled": False,
+                            "yandex_called": False,
+                            "catalog_rating_read": False,
+                        },
+                    ),
+                }
+
+            def _apply_stored_ratings(cc: Dict[str, Any]) -> bool:
+                yr, yc = stored_yandex_rating_from_catalog(cc)
+                if yr is not None and yc >= 0.45:
+                    cc["external_rating"] = yr
+                    cc["external_rating_confidence"] = yc
+                    return True
+                cr, cconf = catalog_aggregate_rating_score(cc.get("card_extras"))
+                if cr is not None and cconf >= 0.45:
+                    cc["external_rating"] = cr
+                    cc["external_rating_confidence"] = cconf
+                    return True
+                return False
+
+            try:
+                y_client = YandexWebSearchClient.from_env()
+            except Exception as exc:
+                errors.append(str(exc))
+                out: List[Dict[str, Any]] = []
+                for c in all_cands:
+                    d = dict(c)
+                    if not _apply_stored_ratings(d):
+                        d.setdefault("external_rating", None)
+                        d.setdefault("external_rating_confidence", 0.0)
+                    out.append(d)
+                return {
+                    **state,
+                    "current_node": "external_rating",
+                    "candidates": out,
+                    "service_errors": errors,
+                    "pipeline_trace": _trace_append(
+                        state,
+                        "external_rating",
+                        {"error": str(exc), "candidate_count": len(out)},
+                    ),
+                }
+
+            sem = asyncio.Semaphore(3)
+
+            async def rate_one(c: Dict[str, Any]) -> Dict[str, Any]:
+                cc = dict(c)
+                if _apply_stored_ratings(cc):
+                    return cc
+                if not use_yandex_serp:
+                    cc["external_rating"] = None
+                    cc["external_rating_confidence"] = 0.0
+                    return cc
+                async with sem:
+                    rating, conf = await enrich_candidate_external_rating(
+                        y_client,
+                        restaurant_name=str(cc.get("name") or ""),
+                        city=city,
+                        address=str(cc.get("address") or "").strip() or None,
+                    )
+                cc["external_rating"] = rating
+                cc["external_rating_confidence"] = conf
+                return cc
+
+            rated_head = await asyncio.gather(*[rate_one(dict(x)) for x in head])
+            tail_out: List[Dict[str, Any]] = []
+            for c in tail:
+                d = dict(c)
+                if not _apply_stored_ratings(d):
+                    d.setdefault("external_rating", None)
+                    d.setdefault("external_rating_confidence", 0.0)
+                tail_out.append(d)
+            merged = list(rated_head) + tail_out
+            return {
+                **state,
+                "current_node": "external_rating",
+                "candidates": merged,
+                "service_errors": errors,
+                "pipeline_trace": _trace_append(
+                    state,
+                    "external_rating",
+                    {"candidate_count": len(merged), "rated_head": len(rated_head)},
                 ),
             }
 
@@ -1008,10 +1615,11 @@ class GraphRunner:
                     ),
                 }
 
-            # Broadening: remove metro/area constraint => use city-wide discovery.
-            location = req.get("location")
-            if isinstance(location, dict) and location.get("type") in {"metro", "area"}:
-                req["location"] = {"type": "none", "value": None}
+            # First relax: keep metro/area; second relax: city-wide discovery.
+            if relax_attempts >= 1:
+                location = req.get("location")
+                if isinstance(location, dict) and location.get("type") in {"metro", "area"}:
+                    req["location"] = {"type": "none", "value": None}
 
             # Expand budget by +15%
             budget = req.get("budget_range") or {}
@@ -1353,12 +1961,17 @@ class GraphRunner:
         # Build graph
         graph = StateGraph(RecState)
         graph.add_node("extract_requirements", extract_requirements_node)
+        graph.add_node("detect_booking_intent", detect_booking_intent_node)
         graph.add_node("ask_questions", ask_questions_node)
         graph.add_node("confirm_search_plan", confirm_search_plan_node)
-        graph.add_node("build_yandex_queries", build_yandex_queries_node)
-        graph.add_node("yandex_web_search", yandex_web_search_node)
-        graph.add_node("dedupe_and_filter_urls", dedupe_and_filter_urls_node)
+        graph.add_node("extract_specific_restaurant", extract_specific_restaurant_requirements_node)
+        graph.add_node("ask_specific_restaurant_questions", ask_specific_restaurant_questions_node)
+        graph.add_node("resolve_specific_restaurant", resolve_specific_restaurant_node)
+        graph.add_node("load_afisha_candidate_urls", load_afisha_candidate_urls_node)
         graph.add_node("fetch_afisha_cards", fetch_afisha_cards_node)
+        graph.add_node("cuisine_prefilter", cuisine_prefilter_node)
+        graph.add_node("geo_gate", geo_gate_node)
+        graph.add_node("external_rating", external_rating_node)
         graph.add_node("toka_capacity_gate", toka_capacity_gate_node)
         graph.add_node("formal_rank", formal_rank_node)
         graph.add_node("take_shortlist", take_shortlist_node)
@@ -1375,24 +1988,40 @@ class GraphRunner:
         def route_after_extract(s: RecState) -> str:
             if s.get("booking_pending"):
                 return "extract_booking_requirements"
+            if s.get("booking_intent_mode") == "specific_restaurant":
+                return "extract_specific_restaurant"
             if not s.get("requirements_complete"):
                 return "ask_questions"
             if not bool(s.get("search_plan_confirmed")):
                 return "confirm_search_plan"
-            return "build_yandex_queries"
+            return "load_afisha_candidate_urls"
 
+        graph.add_edge("extract_requirements", "detect_booking_intent")
         graph.add_conditional_edges(
-            "extract_requirements",
+            "detect_booking_intent",
             route_after_extract,
             path_map={
                 "extract_booking_requirements": "extract_booking_requirements",
+                "extract_specific_restaurant": "extract_specific_restaurant",
                 "ask_questions": "ask_questions",
                 "confirm_search_plan": "confirm_search_plan",
-                "build_yandex_queries": "build_yandex_queries",
+                "load_afisha_candidate_urls": "load_afisha_candidate_urls",
             },
         )
         graph.add_edge("ask_questions", END)
         graph.add_edge("confirm_search_plan", END)
+        graph.add_conditional_edges(
+            "extract_specific_restaurant",
+            lambda s: "ask_specific_restaurant_questions"
+            if (s.get("specific_restaurant_missing_fields") or [])
+            else "resolve_specific_restaurant",
+            path_map={
+                "ask_specific_restaurant_questions": "ask_specific_restaurant_questions",
+                "resolve_specific_restaurant": "resolve_specific_restaurant",
+            },
+        )
+        graph.add_edge("ask_specific_restaurant_questions", END)
+        graph.add_edge("resolve_specific_restaurant", END)
         graph.add_conditional_edges(
             "extract_booking_requirements",
             lambda s: "create_reservation" if s.get("booking_complete") else "ask_booking_questions",
@@ -1404,10 +2033,11 @@ class GraphRunner:
         graph.add_edge("ask_booking_questions", END)
         graph.add_edge("create_reservation", END)
 
-        graph.add_edge("build_yandex_queries", "yandex_web_search")
-        graph.add_edge("yandex_web_search", "dedupe_and_filter_urls")
-        graph.add_edge("dedupe_and_filter_urls", "fetch_afisha_cards")
-        graph.add_edge("fetch_afisha_cards", "toka_capacity_gate")
+        graph.add_edge("load_afisha_candidate_urls", "fetch_afisha_cards")
+        graph.add_edge("fetch_afisha_cards", "cuisine_prefilter")
+        graph.add_edge("cuisine_prefilter", "geo_gate")
+        graph.add_edge("geo_gate", "external_rating")
+        graph.add_edge("external_rating", "toka_capacity_gate")
         graph.add_edge("toka_capacity_gate", "formal_rank")
 
         def route_after_rank(s: RecState) -> str:
@@ -1425,7 +2055,7 @@ class GraphRunner:
             path_map={"relax_fallback": "relax_fallback", "take_shortlist": "take_shortlist", "format_reply": "format_reply"},
         )
 
-        graph.add_edge("relax_fallback", "build_yandex_queries")
+        graph.add_edge("relax_fallback", "load_afisha_candidate_urls")
 
         def route_shortlist_reviews(s: RecState) -> str:
             sl = s.get("shortlist") or []
@@ -1474,6 +2104,11 @@ class GraphRunner:
             if isinstance(_ctx.get("search_plan_fingerprint"), str)
             else None,
             "booking_pending": bool(graph_state.context.get("booking_pending")) if graph_state.context else False,
+            "booking_intent_mode": (
+                str(_ctx.get("booking_intent_mode"))
+                if isinstance(_ctx.get("booking_intent_mode"), str)
+                else None
+            ),
             "booking_selected_candidate": booking_selected_initial,
             "booking_requirements": (graph_state.context.get("booking_requirements") if graph_state.context else {}) or {},
             "booking_complete": bool(graph_state.context.get("booking_complete")) if graph_state.context else False,
@@ -1483,8 +2118,18 @@ class GraphRunner:
             or [],
             "reservation_result": (graph_state.context.get("reservation_result") if graph_state.context else {}) or {},
             "booking_errors": (graph_state.context.get("booking_errors") if graph_state.context else []) or [],
+            "specific_restaurant_requirements": (
+                _ctx.get("specific_restaurant_requirements")
+                if isinstance(_ctx.get("specific_restaurant_requirements"), dict)
+                else {}
+            ),
+            "specific_restaurant_missing_fields": [
+                str(x) for x in (_ctx.get("specific_restaurant_missing_fields") or []) if isinstance(x, str)
+            ],
+            "specific_restaurant_resolved": bool(_ctx.get("specific_restaurant_resolved")),
             "yandex_queries": [],
             "yandex_urls": [],
+            "catalog_entries": [],
             "candidates": [],
             "scored_candidates": [],
             "min_score": 0.0,
@@ -1500,7 +2145,9 @@ class GraphRunner:
         }
 
         trace_batch_id = str(uuid.uuid4())
-        result_state = await app.ainvoke(initial_state)
+        # Default LangGraph limit (25) is too low: search path includes up to two relax
+        # cycles (load→…→formal_rank→relax→load…), which exceeds 25 node steps.
+        result_state = await app.ainvoke(initial_state, config={"recursion_limit": 100})
 
         reply = str(result_state.get("reply") or "")
         trace_events = list(result_state.get("pipeline_trace") or [])
@@ -1511,7 +2158,18 @@ class GraphRunner:
         )
 
         final_context = result_state.copy()
-        _ctx_exclude = {"session_id", "current_node", "reply", "pipeline_trace"}
+        _ctx_exclude = {
+            "session_id",
+            "current_node",
+            "reply",
+            "pipeline_trace",
+            # Ephemeral bulk from catalog / SERP — do not persist (can be thousands of rows).
+            "catalog_entries",
+            "yandex_urls",
+            "yandex_queries",
+            "candidates",
+            "scored_candidates",
+        }
 
         await self.state_repository.append_history(
             session_id=session_id,
@@ -1545,10 +2203,12 @@ def get_graph_runner() -> GraphRunner:
         state_repo = StateRepository(session_maker)
         llm_registry = LLMClientRegistry.from_config()
 
+        catalog_repo = AfishaCatalogRepository(session_maker)
         graph_runner_singleton = GraphRunner(
             session_store=session_store,
             state_repository=state_repo,
             llm_registry=llm_registry,
+            afisha_catalog_repository=catalog_repo,
         )
     return graph_runner_singleton
 
