@@ -217,6 +217,15 @@ class RecState(TypedDict, total=False):
     specific_restaurant_missing_fields: List[str]
     specific_restaurant_resolved: bool
     client_time_zone: Optional[str]
+    # preorder after successful reservation (Toka); must stay in RecState so LangGraph persists keys
+    preorder_phase: Optional[str]
+    preorder_menu_available: bool
+    preorder_organization_id: Optional[str]
+    preorder_store_id: Optional[str]
+    preorder_table_id: Optional[str]
+    preorder_guest_count: Any
+    preorder_cart_lines: Any
+    preorder_order_result: Any
 
 
 @dataclass
@@ -301,6 +310,26 @@ class GraphRunner:
             updated_state = await self.state_repository.get_state_for_session(session_id)
             return {"reply": reply, "session_id": session_id, "state": updated_state.to_dict()}
 
+        if not (
+            client_action
+            and client_action.get("type") in ("submit_booking", "select_booking_candidate")
+        ):
+            ph_raw = ctx.get("preorder_phase")
+            ph = str(ph_raw).strip() if ph_raw is not None else ""
+            if ph in ("offer", "mode_choice", "browsing", "summary"):
+                from .preorder_dialog import try_handle_preorder_dialog
+
+                preorder_out = await try_handle_preorder_dialog(
+                    session_id=session_id,
+                    messages=messages,
+                    client_action=client_action,
+                    ctx=ctx,
+                    state_repository=self.state_repository,
+                    llm_registry=self.llm_registry,
+                )
+                if preorder_out is not None:
+                    return preorder_out
+
         form_booking_payload: Optional[Dict[str, Any]] = None
         if client_action and client_action.get("type") == "submit_booking":
             if not bool(ctx.get("booking_pending")):
@@ -362,6 +391,7 @@ class GraphRunner:
             if form_booking_payload is not None:
                 return {
                     **state,
+                    "booking_pending": True,
                     "current_node": "extract_requirements",
                     "pipeline_trace": _trace_append(
                         state,
@@ -2053,6 +2083,29 @@ class GraphRunner:
                         "store_id": (reservation_data.get("resolved") or {}).get("store_id"),
                     },
                 )
+                resolved = reservation_data.get("resolved") or {}
+                oid = str(resolved.get("organization_id") or "").strip()
+                sid = str(resolved.get("store_id") or "").strip()
+                if oid and sid:
+                    try:
+                        from .preorder_service import menu_tree_has_positions
+
+                        mtree = await gateway.get_menu_tree(oid, sid)
+                        if menu_tree_has_positions(mtree):
+                            tid_pre = str(reservation.get("table_id") or table_id_str or "").strip()
+                            state["preorder_phase"] = "offer"
+                            state["preorder_menu_available"] = True
+                            state["preorder_organization_id"] = oid
+                            state["preorder_store_id"] = sid
+                            state["preorder_table_id"] = tid_pre
+                            state["preorder_guest_count"] = int(guest_count)
+                            state["reply"] = (
+                                str(state.get("reply") or "")
+                                + "\n\nХотите оформить предзаказ к этому столу? "
+                                "Напишите «да», «ок» — или нажмите кнопку «Оформить предзаказ»."
+                            )
+                    except Exception:
+                        logger.debug("preorder menu availability probe failed", exc_info=True)
                 return state
             except Exception as exc:
                 gc_raw = req.get("guest_count")
@@ -2143,6 +2196,10 @@ class GraphRunner:
         graph.set_entry_point("extract_requirements")
 
         def route_after_extract(s: RecState) -> str:
+            # submit_booking must always enter the booking pipeline (do not depend on
+            # booking_pending alone — after a successful reservation it is false).
+            if form_booking_payload is not None:
+                return "extract_booking_requirements"
             if s.get("booking_pending"):
                 return "extract_booking_requirements"
             if s.get("booking_intent_mode") == "specific_restaurant":
@@ -2280,6 +2337,16 @@ class GraphRunner:
             or [],
             "reservation_result": (graph_state.context.get("reservation_result") if graph_state.context else {}) or {},
             "booking_errors": (graph_state.context.get("booking_errors") if graph_state.context else []) or [],
+            "preorder_phase": _ctx.get("preorder_phase"),
+            "preorder_menu_available": bool(_ctx.get("preorder_menu_available")),
+            "preorder_organization_id": _ctx.get("preorder_organization_id"),
+            "preorder_store_id": _ctx.get("preorder_store_id"),
+            "preorder_table_id": _ctx.get("preorder_table_id"),
+            "preorder_guest_count": _ctx.get("preorder_guest_count"),
+            "preorder_cart_lines": _ctx.get("preorder_cart_lines")
+            if isinstance(_ctx.get("preorder_cart_lines"), list)
+            else [],
+            "preorder_order_result": _ctx.get("preorder_order_result"),
             "specific_restaurant_requirements": (
                 _ctx.get("specific_restaurant_requirements")
                 if isinstance(_ctx.get("specific_restaurant_requirements"), dict)

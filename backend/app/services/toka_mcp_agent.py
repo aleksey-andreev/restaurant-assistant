@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from .toka_client import (
     TokaBackofficeClient,
     TokaClientError,
@@ -14,6 +16,7 @@ from .toka_client import (
 )
 from ..storage.database import get_session_maker
 from ..storage.toka_binding_repository import lookup_binding_dto_sync
+
 
 def _ok(data: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "data": data}
@@ -377,6 +380,32 @@ class TokaMcpAgent:
         except Exception as exc:
             return _err("TOKA_UNKNOWN_ERROR", str(exc), retriable=True)
 
+    async def toka_create_order(
+        self,
+        organization_id: str,
+        store_id: str,
+        order_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        try:
+            dto = await self._binding_dto(
+                restaurant_ref={},
+                organization_id=organization_id,
+                store_id=store_id,
+            )
+            if dto is None:
+                return _err(
+                    "RESOLVER_NOT_CONFIGURED",
+                    "No Toka binding in database for this organization/store (or missing default row).",
+                    retriable=False,
+                )
+            client = await get_toka_backoffice_client_for_binding(dto)
+            data = await client.create_order(store_id, dict(order_payload or {}))
+            return _ok({"raw": data})
+        except TokaClientError as exc:
+            return _err("TOKA_API_ERROR", str(exc), retriable=True)
+        except Exception as exc:
+            return _err("TOKA_UNKNOWN_ERROR", str(exc), retriable=True)
+
     async def toka_find_capacity(
         self,
         candidate_ref: Dict[str, Any],
@@ -537,10 +566,14 @@ class TokaMcpAgent:
             interval_end = interval_start + timedelta(minutes=dur)
             date_str = _toka_list_date_str(starts_at, client_time_zone)
             reservations_list = await _load_reservations_for_toka_date(client, org_id, st_id, date_str)
+        except httpx.TimeoutException as exc:
+            msg = str(exc).strip() or f"Toka HTTP timeout ({type(exc).__name__})"
+            return _err("TOKA_API_ERROR", msg, retriable=True)
         except TokaClientError as exc:
             return _err("TOKA_API_ERROR", str(exc), retriable=True)
         except Exception as exc:
-            return _err("TOKA_UNKNOWN_ERROR", str(exc), retriable=True)
+            msg = str(exc).strip() or repr(exc)
+            return _err("TOKA_UNKNOWN_ERROR", msg, retriable=True)
 
         table_id_str: Optional[str] = str(table_id).strip() if table_id else None
         if table_id_str:
@@ -591,10 +624,14 @@ class TokaMcpAgent:
         }
         try:
             reservation = await client.create_reservation(org_id, st_id, payload)
+        except httpx.TimeoutException as exc:
+            msg = str(exc).strip() or f"Toka HTTP timeout ({type(exc).__name__})"
+            return _err("TOKA_API_ERROR", msg, retriable=True)
         except TokaClientError as exc:
             return _err("TOKA_API_ERROR", str(exc), retriable=True)
         except Exception as exc:
-            return _err("TOKA_UNKNOWN_ERROR", str(exc), retriable=True)
+            msg = str(exc).strip() or repr(exc)
+            return _err("TOKA_UNKNOWN_ERROR", msg, retriable=True)
 
         reservation_id = reservation.get("id") or reservation.get("reservation_id") or reservation.get("code")
         table_title_str = find_table_title(halls_raw, str(table_id_str))

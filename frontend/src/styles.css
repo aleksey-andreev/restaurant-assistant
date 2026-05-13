@@ -277,9 +277,8 @@ body {
 .restaurant-card-link:focus-visible,
 .chat-send:focus-visible,
 .chat-new-thread:focus-visible,
-.restaurant-card-select:focus-visible,
-.search-plan-confirm:focus-visible,
-.booking-form-submit:focus-visible {
+.chat-quick-action:focus-visible,
+.form-action-primary:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
@@ -317,23 +316,20 @@ body {
 }
 
 .chat-send:hover:not(:disabled),
-.restaurant-card-select:hover:not(:disabled),
-.search-plan-confirm:hover:not(:disabled),
-.booking-form-submit:hover:not(:disabled) {
+.chat-quick-action:hover:not(:disabled),
+.form-action-primary:hover:not(:disabled) {
   background: var(--brand-primary-hover);
 }
 
 .chat-send:active:not(:disabled),
-.restaurant-card-select:active:not(:disabled),
-.search-plan-confirm:active:not(:disabled),
-.booking-form-submit:active:not(:disabled) {
+.chat-quick-action:active:not(:disabled),
+.form-action-primary:active:not(:disabled) {
   transform: translateY(1px);
 }
 
 .chat-send:disabled,
-.restaurant-card-select:disabled,
-.search-plan-confirm:disabled,
-.booking-form-submit:disabled {
+.chat-quick-action:disabled,
+.form-action-primary:disabled {
   opacity: 0.58;
   cursor: default;
 }
@@ -358,26 +354,31 @@ body {
   max-width: 100%;
 }
 
-/* Plan confirm button: same horizontal alignment as user bubbles */
+/* Quick actions under chat bubbles (Подтвердить, предзаказ, …): right-aligned, width from label */
 .chat-message-plan-confirm {
   margin-top: -0.25rem;
+  align-self: stretch;
 }
 
-.search-plan-panel-actions {
+.chat-quick-actions {
   display: flex;
   flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
   gap: 0.5rem;
+  width: 100%;
 }
 
-.search-plan-panel-actions--column {
+.chat-quick-actions--stack {
   flex-direction: column;
   align-items: flex-end;
   flex-wrap: nowrap;
 }
 
-.search-plan-confirm,
-.restaurant-card-select,
-.booking-form-submit {
+.chat-quick-action {
+  width: max-content;
+  max-width: 100%;
+  box-sizing: border-box;
   border: none;
   background: var(--brand-primary);
   color: var(--brand-contrast);
@@ -385,7 +386,43 @@ body {
   padding: 0.47rem 0.9rem;
   font-size: 0.84rem;
   font-weight: 700;
+  font-family: inherit;
   cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease,
+    transform 120ms ease;
+}
+
+/* Primary actions inside cards/forms (not chat quick replies): full width, centered label */
+.form-action-primary {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  border: none;
+  background: var(--brand-primary);
+  color: var(--brand-contrast);
+  border-radius: var(--radius-pill);
+  padding: 0.47rem 0.9rem;
+  font-size: 0.84rem;
+  font-weight: 700;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease,
+    transform 120ms ease;
+}
+
+.restaurant-card .form-action-primary {
+  align-self: stretch;
+  margin-top: auto;
+}
+
+.booking-form .form-action-primary {
+  align-self: stretch;
 }
 
 .restaurant-card-list {
@@ -528,13 +565,6 @@ body {
   color: var(--text-muted);
 }
 
-.restaurant-card-select {
-  align-self: flex-start;
-  margin-top: auto;
-  min-height: 2.35rem;
-  box-sizing: border-box;
-}
-
 .dialog-extras-errors {
   margin-top: 0.5rem;
   padding: 0.58rem 0.68rem;
@@ -640,6 +670,105 @@ body {
   color: #125327;
   text-align: right;
   font-weight: 500;
+}
+
+/* Preorder menu (after booking): full width of chat column, same intent as .booking-form */
+.menu-preorder-card {
+  margin-top: 0.75rem;
+  width: 100%;
+  max-width: 100%;
+  align-self: stretch;
+  box-sizing: border-box;
+}
+
+.menu-preorder-scroll {
+  max-height: 55vh;
+  overflow-y: auto;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.menu-preorder-node-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-weight: 600;
+  padding: 0.35rem 0;
+  cursor: pointer;
+  color: inherit;
+}
+
+.menu-preorder-chevron {
+  width: 1rem;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.menu-preorder-node-body {
+  padding-left: 0.35rem;
+  border-left: 2px solid #ffe4d4;
+  margin: 0.15rem 0 0.5rem 0.35rem;
+}
+
+.menu-preorder-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  padding: 0.35rem 0;
+  cursor: pointer;
+}
+
+.menu-preorder-item-title {
+  flex: 1 1 auto;
+}
+
+.menu-preorder-item-price {
+  flex-shrink: 0;
+  font-weight: 600;
+}
+
+.menu-preorder-checkbox {
+  width: 1.05rem;
+  height: 1.05rem;
+  margin-top: 0.12rem;
+}
+
+.menu-preorder-item--checked .menu-preorder-checkbox {
+  accent-color: var(--brand-primary);
+}
+
+.menu-preorder-footer {
+  position: sticky;
+  bottom: 0;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, #fff 18%);
+  padding-top: 0.5rem;
+  margin-top: 0.25rem;
+  border-top: 1px solid var(--border-default);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.menu-preorder-footer-row {
+  display: flex;
+  justify-content: space-between;
+  font-weight: 600;
+  margin-bottom: 0.45rem;
+}
+
+.menu-preorder-error {
+  color: #b00020;
+  font-size: 0.86rem;
+  margin: 0.25rem 0;
+}
+
+.menu-preorder-muted {
+  color: #666;
+  font-size: 0.88rem;
 }
 
 @media (min-width: 768px) {

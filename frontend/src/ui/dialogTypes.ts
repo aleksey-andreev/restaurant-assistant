@@ -53,6 +53,14 @@ export type ReservationResult = {
   [key: string]: unknown;
 };
 
+export type PreorderCartLine = {
+  menu_item_id: string;
+  quantity: number;
+  title?: string | null;
+  price?: number | null;
+  section?: string | null;
+};
+
 export type DialogContext = {
   booking_intent_mode?: "specific_restaurant" | "search" | null;
   /** IANA timezone from browser; set once per session */
@@ -74,6 +82,14 @@ export type DialogContext = {
   booking_missing_fields?: string[];
   booking_errors?: string[];
   reservation_result?: ReservationResult | null;
+  preorder_phase?: string | null;
+  preorder_menu_available?: boolean | null;
+  preorder_organization_id?: string | null;
+  preorder_store_id?: string | null;
+  preorder_table_id?: string | null;
+  preorder_guest_count?: number | null;
+  preorder_cart_lines?: PreorderCartLine[] | null;
+  preorder_order_result?: Record<string, unknown> | null;
   specific_restaurant_requirements?: {
     name?: string | null;
     city?: string | null;

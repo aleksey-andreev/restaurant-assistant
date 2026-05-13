@@ -270,10 +270,10 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
     <div className="dialog-extras">
       {showErrorActions && (
         <div className="chat-message chat-message-user chat-message-plan-confirm">
-          <div className="search-plan-panel-actions search-plan-panel-actions--column">
+          <div className="chat-quick-actions chat-quick-actions--stack">
             <button
               type="button"
-              className="search-plan-confirm"
+              className="chat-quick-action"
               onClick={onEditBookingParams}
               disabled={loading}
             >
@@ -281,7 +281,7 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
             </button>
             <button
               type="button"
-              className="search-plan-confirm"
+              className="chat-quick-action"
               onClick={onNewBookingThread}
               disabled={loading}
             >
@@ -361,7 +361,7 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
                         {bookingPending && !bookingComplete && (
                           <button
                             type="button"
-                            className="restaurant-card-select"
+                            className="form-action-primary"
                             disabled={
                               loading ||
                               active ||
@@ -461,7 +461,7 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
                   required
                 />
               </label>
-              <button type="submit" className="booking-form-submit" disabled={loading}>
+              <button type="submit" className="form-action-primary" disabled={loading}>
                 Отправить заявку
               </button>
             </form>

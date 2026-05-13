@@ -1,6 +1,11 @@
 import React, { useCallback, useMemo, useState } from "react";
 import { DialogExtras } from "./DialogExtras";
-import { DialogContext, shouldShowSearchPlanConfirmButton } from "./dialogTypes";
+import {
+  DialogContext,
+  PreorderCartLine,
+  shouldShowSearchPlanConfirmButton
+} from "./dialogTypes";
+import { MenuPreorderCard } from "./MenuPreorderCard";
 
 type Message = {
   role: "user" | "assistant";
@@ -23,7 +28,14 @@ type ClientAction =
       guest_name: string;
       guest_phone: string;
       table_id?: string;
-    };
+    }
+  | { type: "confirm_preorder_offer" }
+  | { type: "preorder_decline_offer" }
+  | { type: "preorder_choose_manual" }
+  | { type: "preorder_llm_pick"; preferences_text?: string | null }
+  | { type: "preorder_submit_cart"; lines: PreorderCartLine[] }
+  | { type: "preorder_confirm_order" }
+  | { type: "preorder_amend" };
 
 type ChatProps = {
   sessionId: string | null;
@@ -200,6 +212,27 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
     }
   };
 
+  const preorderAction = useCallback(
+    async (action: ClientAction, syntheticUser?: string) => {
+      if (loading) return;
+      const extra = (syntheticUser || "").trim();
+      const base: Message[] = extra
+        ? [...messages, { role: "user" as const, content: extra }]
+        : messages;
+      if (extra) setMessages(base);
+      setLoading(true);
+      setNetworkError(null);
+      try {
+        await postDialog(base, action);
+      } catch {
+        setNetworkError("Сервер временно недоступен. Проверьте подключение и повторите попытку.");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [loading, messages, postDialog]
+  );
+
   const lastAssistantIndex = useMemo(() => lastAssistantMessageIndex(messages), [messages]);
 
   const submitBooking = async (payload: {
@@ -263,6 +296,15 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
       const bookingComplete = Boolean(ctx?.booking_complete);
 
       if (bookingComplete) {
+        setBookingUiHidden(true);
+        setBookingErrorActionsVisible(false);
+        const node =
+          data.state && typeof data.state.current_node === "string"
+            ? data.state.current_node
+            : null;
+        setDialogContext(ctx);
+        setDialogCurrentNode(node);
+
         const res = ctx?.reservation_result ?? null;
         const req = ctx?.booking_requirements ?? {};
         const selected = ctx?.booking_selected_candidate ?? null;
@@ -282,9 +324,7 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
         const gName =
           firstNonEmptyStr(res?.guest_name) ?? firstNonEmptyStr(req?.guest_name) ?? payload.guestName;
         const gPhone =
-          firstNonEmptyStr(res?.guest_phone) ??
-          firstNonEmptyStr(req?.guest_phone) ??
-          payload.guestPhone;
+          firstNonEmptyStr(res?.guest_phone) ?? firstNonEmptyStr(req?.guest_phone) ?? payload.guestPhone;
         const tableTitle =
           firstNonEmptyStr(
             typeof res?.table_title === "string" ? res.table_title : undefined
@@ -296,7 +336,7 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
               ? Math.floor(req.guest_count)
               : payload.guestCount;
         const tableLineConfirm = tableTitle ?? "—";
-        const assistantMessage = [
+        const assistantBooking = [
           `Бронь подтверждена в ресторане «${rName}».`,
           formatBookingDetailBullets({
             address: rAddress,
@@ -308,9 +348,20 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
           })
         ].join("\n");
 
-        setBookingUiHidden(true);
-        setBookingErrorActionsVisible(false);
-        setMessages([...newMessages, { role: "assistant", content: assistantMessage }]);
+        const preorderAvail =
+          Boolean(ctx?.preorder_menu_available) && ctx?.preorder_phase === "offer";
+        const preorderPrompt =
+          "Хотите оформить предзаказ к этому столу? Напишите «да», «ок» — или нажмите кнопку «Оформить предзаказ».";
+
+        if (preorderAvail) {
+          setMessages([
+            ...newMessages,
+            { role: "assistant", content: assistantBooking },
+            { role: "assistant", content: preorderPrompt }
+          ]);
+        } else {
+          setMessages([...newMessages, { role: "assistant", content: assistantBooking }]);
+        }
       } else {
         const errs = ctx?.booking_errors;
         const hasFormErrors = Array.isArray(errs) && errs.length > 0;
@@ -388,10 +439,10 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
                     </div>
                   </div>
                   <div className="chat-message chat-message-user chat-message-plan-confirm">
-                    <div className="search-plan-panel-actions">
+                    <div className="chat-quick-actions">
                       <button
                         type="button"
-                        className="search-plan-confirm"
+                        className="chat-quick-action"
                         disabled={loading}
                         onClick={() => void confirmSearchPlan()}
                         aria-label="Подтвердить параметры поиска"
@@ -422,6 +473,81 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
             <div className="chat-message chat-message-assistant">
               <div className="chat-bubble chat-bubble-loading">
                 Думаю над вашим запросом...
+              </div>
+            </div>
+          )}
+
+          {!loading && dialogContext?.preorder_phase === "offer" && dialogContext.preorder_menu_available && (
+            <div className="chat-message chat-message-user chat-message-plan-confirm">
+              <div className="chat-quick-actions chat-quick-actions--stack">
+                <button
+                  type="button"
+                  className="chat-quick-action"
+                  onClick={() => void preorderAction({ type: "confirm_preorder_offer" }, "Да")}
+                >
+                  Оформить предзаказ
+                </button>
+                <button
+                  type="button"
+                  className="chat-quick-action"
+                  onClick={() => void preorderAction({ type: "preorder_decline_offer" })}
+                >
+                  Не сейчас
+                </button>
+              </div>
+            </div>
+          )}
+          {!loading && dialogContext?.preorder_phase === "mode_choice" && dialogContext.preorder_menu_available && (
+            <div className="chat-message chat-message-user chat-message-plan-confirm">
+              <div className="chat-quick-actions">
+                <button
+                  type="button"
+                  className="chat-quick-action"
+                  onClick={() =>
+                    void preorderAction({ type: "preorder_choose_manual" }, "Выберу сам из меню")
+                  }
+                >
+                  Выберу сам из меню
+                </button>
+              </div>
+            </div>
+          )}
+          {!loading &&
+            dialogContext?.preorder_phase === "browsing" &&
+            dialogContext.preorder_menu_available &&
+            typeof dialogContext.preorder_organization_id === "string" &&
+            dialogContext.preorder_organization_id.trim() &&
+            typeof dialogContext.preorder_store_id === "string" &&
+            dialogContext.preorder_store_id.trim() && (
+              <MenuPreorderCard
+                organizationId={dialogContext.preorder_organization_id.trim()}
+                storeId={dialogContext.preorder_store_id.trim()}
+                initialLines={
+                  Array.isArray(dialogContext.preorder_cart_lines)
+                    ? (dialogContext.preorder_cart_lines as PreorderCartLine[])
+                    : []
+                }
+                loading={loading}
+                onSubmitCart={lines => void preorderAction({ type: "preorder_submit_cart", lines })}
+              />
+            )}
+          {!loading && dialogContext?.preorder_phase === "summary" && (
+            <div className="chat-message chat-message-user chat-message-plan-confirm">
+              <div className="chat-quick-actions chat-quick-actions--stack">
+                <button
+                  type="button"
+                  className="chat-quick-action"
+                  onClick={() => void preorderAction({ type: "preorder_confirm_order" }, "Подтверждаю")}
+                >
+                  Подтвердить
+                </button>
+                <button
+                  type="button"
+                  className="chat-quick-action"
+                  onClick={() => void preorderAction({ type: "preorder_amend" })}
+                >
+                  Внести изменения
+                </button>
               </div>
             </div>
           )}

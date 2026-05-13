@@ -36,8 +36,49 @@ class ConfirmSearchPlanAction(BaseModel):
     type: Literal["confirm_search_plan"] = "confirm_search_plan"
 
 
+class ConfirmPreorderOfferAction(BaseModel):
+    type: Literal["confirm_preorder_offer"] = "confirm_preorder_offer"
+
+
+class PreorderDeclineOfferAction(BaseModel):
+    type: Literal["preorder_decline_offer"] = "preorder_decline_offer"
+
+
+class PreorderChooseManualAction(BaseModel):
+    type: Literal["preorder_choose_manual"] = "preorder_choose_manual"
+
+
+class PreorderLlmPickAction(BaseModel):
+    type: Literal["preorder_llm_pick"] = "preorder_llm_pick"
+    preferences_text: Optional[str] = Field(default=None, max_length=4000)
+
+
+class PreorderSubmitCartAction(BaseModel):
+    type: Literal["preorder_submit_cart"] = "preorder_submit_cart"
+    lines: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class PreorderConfirmOrderAction(BaseModel):
+    type: Literal["preorder_confirm_order"] = "preorder_confirm_order"
+
+
+class PreorderAmendAction(BaseModel):
+    type: Literal["preorder_amend"] = "preorder_amend"
+
+
 DialogClientAction = Annotated[
-    Union[SelectBookingCandidateAction, SubmitBookingAction, ConfirmSearchPlanAction],
+    Union[
+        SelectBookingCandidateAction,
+        SubmitBookingAction,
+        ConfirmSearchPlanAction,
+        ConfirmPreorderOfferAction,
+        PreorderDeclineOfferAction,
+        PreorderChooseManualAction,
+        PreorderLlmPickAction,
+        PreorderSubmitCartAction,
+        PreorderConfirmOrderAction,
+        PreorderAmendAction,
+    ],
     Field(discriminator="type"),
 ]
 

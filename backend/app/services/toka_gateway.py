@@ -46,6 +46,16 @@ class TokaGateway:
         raw = data.get("raw")
         return raw if isinstance(raw, dict) else {}
 
+    async def create_order(
+        self,
+        organization_id: str,
+        store_id: str,
+        order_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return self._unwrap(
+            await self._agent.toka_create_order(organization_id, store_id, order_payload)
+        )
+
     async def find_capacity(
         self,
         candidate_ref: Dict[str, Any],

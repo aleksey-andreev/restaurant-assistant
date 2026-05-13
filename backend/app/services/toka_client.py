@@ -25,6 +25,15 @@ def _toka_base_url() -> str:
     ).rstrip("/")
 
 
+def _reservation_create_timeout_sec() -> float:
+    """POST create reservation can exceed default client timeout; clamp 30..300 s."""
+    raw = os.environ.get("TOKA_RESERVATION_CREATE_TIMEOUT_SEC", "120")
+    try:
+        return max(30.0, min(float(raw), 300.0))
+    except (TypeError, ValueError):
+        return 120.0
+
+
 def _log_toka_token_response(operation: str, resp: httpx.Response) -> None:
     """Полное тело ответа Toka при выдаче/обновлении токенов (в лог сервера)."""
     logger.info(
@@ -274,9 +283,14 @@ class TokaBackofficeClient:
         *,
         json: Any = None,
         params: Any = None,
+        timeout: Optional[float] = None,
     ) -> httpx.Response:
         await self._ensure_logged_in()
         headers = self._auth_headers()
+        if timeout is not None:
+            return await self._client.request(
+                method, path, headers=headers, json=json, params=params, timeout=timeout
+            )
         return await self._client.request(
             method, path, headers=headers, json=json, params=params
         )
@@ -288,19 +302,20 @@ class TokaBackofficeClient:
         *,
         json: Any = None,
         params: Any = None,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Perform request; on 401 reload refresh from DB (if configured), refresh tokens, retry twice.
         """
-        resp = await self._do_authorized(method, path, json=json, params=params)
+        resp = await self._do_authorized(method, path, json=json, params=params, timeout=timeout)
         if resp.status_code == 401:
             async with self._auth_lock:
                 await self._recover_from_401()
-            resp = await self._do_authorized(method, path, json=json, params=params)
+            resp = await self._do_authorized(method, path, json=json, params=params, timeout=timeout)
         if resp.status_code == 401:
             async with self._auth_lock:
                 await self._recover_from_401()
-            resp = await self._do_authorized(method, path, json=json, params=params)
+            resp = await self._do_authorized(method, path, json=json, params=params, timeout=timeout)
         if resp.status_code >= 400:
             raise TokaClientError(
                 f"Toka API error {resp.status_code} on {path}: {resp.text[:1000]}"
@@ -333,6 +348,12 @@ class TokaBackofficeClient:
             f"/api/menus/{organization_id}/stores/{store_id}/menus/tree",
         )
 
+    async def create_order(self, store_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        sid = (store_id or "").strip()
+        if not sid:
+            raise TokaClientError("create_order: empty store_id")
+        return await self.request_json("POST", f"/api/orders/{sid}", json=payload)
+
     async def list_reservations(
         self,
         organization_id: str,
@@ -357,6 +378,7 @@ class TokaBackofficeClient:
             "POST",
             f"/api/reservations/{organization_id}/{store_id}/reservations",
             json=payload,
+            timeout=_reservation_create_timeout_sec(),
         )
 
 
