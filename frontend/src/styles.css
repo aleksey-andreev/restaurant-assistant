@@ -399,7 +399,8 @@ body {
   overflow-x: auto;
   overflow-y: hidden;
   -webkit-overflow-scrolling: touch;
-  touch-action: pan-x;
+  /* pan-x alone blocks vertical scroll on the parent chat area on touch devices */
+  touch-action: pan-x pan-y;
   scroll-snap-type: x proximity;
   padding-bottom: 0.35rem;
 }
