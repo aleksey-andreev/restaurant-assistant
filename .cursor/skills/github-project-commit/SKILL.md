@@ -86,3 +86,26 @@ After commit, report:
 - Included files (high level).
 - Checks run and their status.
 - Whether branch is ahead of remote and next suggested command (`git push` if requested).
+
+### VM update commands (always append)
+
+After the items above, **always** add a short block the user can run **on the VM** to refresh the deployed app. Assume this repository: production-style update is `deploy/update-vm.sh` (git pull `main`, optional DB restore from dump, `docker compose -f docker-compose.prod.yml` rebuild/up).
+
+Use **placeholders** the user can replace (`USER`, `HOST`, `REPO_DIR`). Do not invent real hosts or paths from the user’s machine unless they were stated in the chat.
+
+Suggested copy-paste shape (adapt wording if the user’s deployment differs, e.g. no Docker):
+
+```text
+# On your laptop (if local main is ahead of origin):
+git push origin main
+
+# On the VM (SSH, then project root — update-vm.sh pulls main itself):
+ssh USER@HOST
+cd REPO_DIR
+bash deploy/update-vm.sh
+
+# Same script but skip DB restore (code/config only):
+SKIP_DB_RESTORE=1 bash deploy/update-vm.sh
+```
+
+If the user has no VM or uses another rollout, say so in one line and still give the closest equivalent (e.g. only `docker compose` up) or point to skill `remote-vm-app-updates` for a custom SSH checklist.
