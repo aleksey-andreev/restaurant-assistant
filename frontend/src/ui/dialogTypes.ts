@@ -39,6 +39,7 @@ export type BookingRequirements = {
   guest_count?: number | null;
   guest_name?: string | null;
   guest_phone?: string | null;
+  table_id?: string | null;
 };
 
 export type ReservationResult = {
@@ -47,11 +48,15 @@ export type ReservationResult = {
   guest_phone?: string | null;
   restaurant_name?: string | null;
   restaurant_address?: string | null;
+  table_id?: string | null;
+  table_title?: string | null;
   [key: string]: unknown;
 };
 
 export type DialogContext = {
   booking_intent_mode?: "specific_restaurant" | "search" | null;
+  /** IANA timezone from browser; set once per session */
+  client_time_zone?: string | null;
   final_recommendations?: RestaurantCandidate[];
   recommendations?: RestaurantCandidate[];
   shortlist?: RestaurantCandidate[];
@@ -60,6 +65,8 @@ export type DialogContext = {
   missing_fields?: string[];
   search_plan_confirmed?: boolean;
   search_plan_fingerprint?: string | null;
+  /** Internal: user declined plan summary; next reply asks what to change */
+  search_plan_revision_requested?: boolean;
   booking_pending?: boolean;
   booking_complete?: boolean;
   booking_selected_candidate?: RestaurantCandidate | null;
@@ -100,4 +107,21 @@ export function needsSearchPlanConfirm(ctx: DialogContext | null | undefined): b
   if (!ctx.requirements_complete) return false;
   if (ctx.search_plan_confirmed) return false;
   return true;
+}
+
+/**
+ * Кнопка «Подтвердить» — только когда граф закончил ход на узле `confirm_search_plan`
+ * (там же формируется текст «Параметры поиска (проверьте и подтвердите): …»).
+ *
+ * Одних полей контекста недостаточно: после пустой выдачи бэкенд сбрасывает
+ * `search_plan_confirmed` в false при `requirements_complete`, и тогда
+ * `needsSearchPlanConfirm` снова true при `current_node === "format_reply"` — без проверки
+ * узла кнопка ошибочно показывалась бы снова.
+ */
+export function shouldShowSearchPlanConfirmButton(
+  ctx: DialogContext | null | undefined,
+  graphCurrentNode: string | null | undefined
+): boolean {
+  if (graphCurrentNode !== "confirm_search_plan") return false;
+  return needsSearchPlanConfirm(ctx);
 }

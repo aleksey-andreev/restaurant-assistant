@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import json
 import os
 import uuid
@@ -18,7 +19,9 @@ from ..storage.afisha_catalog_repository import (
 )
 from ..storage.session_store import SessionStore
 from ..storage.state_repository import StateRepository
+from .search_plan_short_reply import classify_search_plan_short_reply
 
+logger = logging.getLogger(__name__)
 
 def fingerprint_search_plan(req: Dict[str, Any]) -> str:
     """Stable fingerprint for search-relevant requirement fields (confirm / invalidate)."""
@@ -60,7 +63,7 @@ def fingerprint_search_plan(req: Dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
 
-def format_search_plan_summary(req: Dict[str, Any]) -> str:
+def format_search_plan_summary(req: Dict[str, Any], *, include_confirmation_hint: bool = True) -> str:
     """Human-readable plan for user confirmation (no occasion; cuisine default)."""
     city = req.get("city") if isinstance(req.get("city"), str) else ""
     city = city.strip() or "—"
@@ -108,10 +111,15 @@ def format_search_plan_summary(req: Dict[str, Any]) -> str:
         f"- Бюджет: {budget_s}",
         f"- Локация: {loc_s}",
         f"- Кухня: {cuisine_s}",
-        "",
-        "Если всё верно — нажмите «Подтвердить поиск» под чатом. "
-        "Чтобы изменить параметры — напишите уточнение в чате.",
     ]
+    if include_confirmation_hint:
+        lines.extend(
+            [
+                "",
+                "Если всё верно — нажмите «Подтвердить» под сообщением или ответьте коротким согласием в чате. "
+                "Чтобы изменить параметры — напишите уточнение в чате.",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -198,6 +206,7 @@ class RecState(TypedDict, total=False):
     # plan → act: user must confirm extracted search params before Yandex/Afisha
     search_plan_confirmed: bool
     search_plan_fingerprint: Optional[str]
+    search_plan_revision_requested: bool
     repeated_missing_fields: List[str]
     requirements_prompt_count: int
     # analytics: append-only events persisted in graph_state.context
@@ -207,6 +216,7 @@ class RecState(TypedDict, total=False):
     specific_restaurant_requirements: Dict[str, Any]
     specific_restaurant_missing_fields: List[str]
     specific_restaurant_resolved: bool
+    client_time_zone: Optional[str]
 
 
 @dataclass
@@ -230,12 +240,21 @@ class GraphRunner:
         messages: List[Dict[str, Any]],
         session_id: Optional[str],
         client_action: Optional[Dict[str, Any]] = None,
+        client_time_zone: Optional[str] = None,
     ) -> Dict[str, Any]:
         session = await self.session_store.get_or_create_session(session_id)
         session_id = session.session_id
 
         graph_state = await self.state_repository.get_state_for_session(session_id)
         ctx = graph_state.context or {}
+
+        if client_time_zone and isinstance(client_time_zone, str) and client_time_zone.strip():
+            tz = client_time_zone.strip()[:128]
+            existing_tz = ctx.get("client_time_zone")
+            if not (isinstance(existing_tz, str) and existing_tz.strip()):
+                await self.state_repository.merge_context_patch(session_id, {"client_time_zone": tz})
+                graph_state = await self.state_repository.get_state_for_session(session_id)
+                ctx = graph_state.context or {}
 
         booking_selected_override: Optional[Dict[str, Any]] = None
         if client_action and client_action.get("type") == "select_booking_candidate":
@@ -301,6 +320,7 @@ class GraphRunner:
                 "guest_count": int(client_action["guest_count"]),
                 "guest_name": str(client_action.get("guest_name") or "").strip(),
                 "guest_phone": str(client_action.get("guest_phone") or "").strip(),
+                "table_id": client_action.get("table_id"),
             }
 
         llm_client, system_prompt, node_params = self.llm_registry.get_default_node()
@@ -418,6 +438,7 @@ class GraphRunner:
                         "missing_fields": miss0,
                         "search_plan_confirmed": bool(state.get("search_plan_confirmed")),
                         "search_plan_fingerprint": state.get("search_plan_fingerprint"),
+                        "search_plan_revision_requested": False,
                         "pipeline_trace": _trace_append(
                             state,
                             "extract_requirements",
@@ -433,12 +454,56 @@ class GraphRunner:
                     "missing_fields": [],
                     "search_plan_confirmed": True,
                     "search_plan_fingerprint": fp0,
+                    "search_plan_revision_requested": False,
                     "pipeline_trace": _trace_append(
                         state,
                         "extract_requirements",
                         {"skipped_llm": True, "reason": "confirm_search_plan", "fingerprint": fp0},
                     ),
                 }
+
+            if not client_action and not bool(state.get("booking_pending")):
+                req_check = dict(state.get("recommendation_requirements") or {})
+                miss_check = _missing_fields_for_req(req_check)
+                if not miss_check and not bool(state.get("search_plan_confirmed")):
+                    short = classify_search_plan_short_reply(_last_user_text())
+                    if short == "affirm":
+                        fp_a = fingerprint_search_plan(req_check)
+                        return {
+                            **state,
+                            "current_node": "extract_requirements",
+                            "recommendation_requirements": req_check,
+                            "requirements_complete": True,
+                            "missing_fields": [],
+                            "search_plan_confirmed": True,
+                            "search_plan_fingerprint": fp_a,
+                            "search_plan_revision_requested": False,
+                            "pipeline_trace": _trace_append(
+                                state,
+                                "extract_requirements",
+                                {
+                                    "skipped_llm": True,
+                                    "reason": "short_reply_affirm",
+                                    "fingerprint": fp_a,
+                                },
+                            ),
+                        }
+                    if short == "reject":
+                        return {
+                            **state,
+                            "current_node": "extract_requirements",
+                            "recommendation_requirements": req_check,
+                            "requirements_complete": True,
+                            "missing_fields": [],
+                            "search_plan_confirmed": False,
+                            "search_plan_revision_requested": True,
+                            "search_plan_fingerprint": state.get("search_plan_fingerprint"),
+                            "pipeline_trace": _trace_append(
+                                state,
+                                "extract_requirements",
+                                {"skipped_llm": True, "reason": "short_reply_reject"},
+                            ),
+                        }
 
             user_dialog_text = _user_dialog_text_for_requirements_extraction()
             prompt_sys = (
@@ -524,6 +589,7 @@ class GraphRunner:
                     "recommendation_requirements": prev_fixed,
                     "search_plan_confirmed": False,
                     "search_plan_fingerprint": fp_fail,
+                    "search_plan_revision_requested": False,
                     "pipeline_trace": _trace_append(
                         state,
                         "extract_requirements",
@@ -687,6 +753,7 @@ class GraphRunner:
                 "repeated_missing_fields": repeated_missing_fields,
                 "search_plan_confirmed": confirmed_out,
                 "search_plan_fingerprint": new_fp,
+                "search_plan_revision_requested": False,
                 "pipeline_trace": _trace_append(
                     state,
                     "extract_requirements",
@@ -702,6 +769,21 @@ class GraphRunner:
                     },
                 ),
             }
+
+        async def ask_search_plan_revision_node(state: RecState) -> RecState:
+            req = state.get("recommendation_requirements") or {}
+            summary = format_search_plan_summary(
+                req if isinstance(req, dict) else {}, include_confirmation_hint=False
+            )
+            state["reply"] = (
+                "Хорошо. Напишите, что изменить в параметрах поиска "
+                "(город, число гостей, бюджет, район или метро) — можно одним сообщением.\n\n"
+                f"{summary}"
+            )
+            state["search_plan_revision_requested"] = False
+            state["current_node"] = "ask_search_plan_revision"
+            state["pipeline_trace"] = _trace_append(state, "ask_search_plan_revision", {})
+            return state
 
         async def confirm_search_plan_node(state: RecState) -> RecState:
             req = state.get("recommendation_requirements") or {}
@@ -1833,6 +1915,10 @@ class GraphRunner:
                 gp_fb = fb.get("guest_phone")
                 if not (isinstance(gp_fb, str) and gp_fb.strip()):
                     missing_fields_fb.append("guest_phone")
+                tid_fb = fb.get("table_id")
+                table_id_norm: Optional[str] = None
+                if isinstance(tid_fb, str) and tid_fb.strip():
+                    table_id_norm = tid_fb.strip()
                 booking_complete_fb = len(missing_fields_fb) == 0
                 normalized_fb: Dict[str, Any] = {
                     "starts_at": starts_at,
@@ -1841,6 +1927,7 @@ class GraphRunner:
                     "guest_phone": gp_fb.strip() if isinstance(gp_fb, str) else None,
                     "guest_count": guest_count_norm_fb,
                     "notes": "",
+                    "table_id": table_id_norm,
                 }
                 return {
                     **state,
@@ -1896,11 +1983,19 @@ class GraphRunner:
             req = state.get("booking_requirements") or {}
             booking_errors: List[str] = []
             try:
-                from ..services.toka_gateway import get_toka_gateway
+                from ..services.toka_gateway import get_toka_gateway, TokaGatewayError
 
                 gateway = await get_toka_gateway()
                 starts_at = str(req.get("starts_at"))
                 guest_count = int(req.get("guest_count"))
+                tid_req = req.get("table_id")
+                table_id_kw: Optional[str] = None
+                if isinstance(tid_req, str) and tid_req.strip():
+                    table_id_kw = tid_req.strip()
+                ctz_raw = state.get("client_time_zone")
+                ctz: Optional[str] = None
+                if isinstance(ctz_raw, str) and ctz_raw.strip():
+                    ctz = ctz_raw.strip()[:128]
                 reservation_data = await gateway.create_reservation(
                     restaurant_ref=dict(state.get("booking_selected_candidate") or {}),
                     starts_at=starts_at,
@@ -1909,8 +2004,24 @@ class GraphRunner:
                     guest_phone=str(req.get("guest_phone") or ""),
                     guest_count=guest_count,
                     notes=str(req.get("notes") or ""),
+                    table_id=table_id_kw,
+                    client_time_zone=ctz,
                 )
-                reservation = reservation_data.get("raw") or reservation_data
+                raw = reservation_data.get("raw")
+                reservation: Dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+                for k in (
+                    "starts_at",
+                    "guest_count",
+                    "guest_name",
+                    "guest_phone",
+                    "table_id",
+                    "table_title",
+                    "restaurant_name",
+                    "restaurant_address",
+                ):
+                    v = reservation_data.get(k)
+                    if v is not None and v != "":
+                        reservation[k] = v
                 state["reservation_result"] = reservation
                 state["booking_pending"] = False
                 state["booking_complete"] = True
@@ -1924,11 +2035,13 @@ class GraphRunner:
                     or None
                 )
                 rid_part = f" (id: {reservation_id})" if reservation_id else ""
+                tt = reservation.get("table_title")
+                table_part = f" Стол: {tt}." if isinstance(tt, str) and tt.strip() else ""
                 state["reply"] = (
                     "Готово — бронирование создано. "
                     f"Ресторан: {state.get('booking_selected_candidate', {}).get('name') or '—'}. "
                     f"Дата/время: {starts_at}. "
-                    f"Гостей: {guest_count}.{rid_part}"
+                    f"Гостей: {guest_count}.{table_part}{rid_part}"
                 )
                 state["current_node"] = "create_reservation"
                 state["pipeline_trace"] = _trace_append(
@@ -1942,19 +2055,62 @@ class GraphRunner:
                 )
                 return state
             except Exception as exc:
-                booking_errors.append(str(exc))
+                gc_raw = req.get("guest_count")
+                try:
+                    gc_i = int(gc_raw) if gc_raw is not None else None
+                except Exception:
+                    gc_i = None
+
+                technical_codes = {"TOKA_API_ERROR", "TOKA_UNKNOWN_ERROR", "RESOLVER_NOT_CONFIGURED"}
+
+                if isinstance(exc, TokaGatewayError):
+                    code = str(getattr(exc, "code", "") or "")
+                    explicit_table = bool(
+                        isinstance(req.get("table_id"), str) and str(req.get("table_id")).strip()
+                    )
+                    if code in technical_codes:
+                        logger.exception("Toka reservation failed (technical): code=%s", code)
+                        state["reply"] = "Произошла техническая ошибка. Попробуйте позже."
+                        state["booking_errors"] = []
+                    elif code == "NO_TABLE_AVAILABLE":
+                        if explicit_table:
+                            state["booking_errors"] = [
+                                "Выбранный стол занят в указанное время. "
+                                "Выберите другое время или дату, либо другой стол."
+                            ]
+                            state["reply"] = "Не удалось подтвердить бронь — см. сообщение в форме ниже."
+                        else:
+                            state["booking_errors"] = []
+                            g = f" на {gc_i} гостей" if gc_i and gc_i >= 1 else ""
+                            state["reply"] = (
+                                "На выбранное время нет свободного столика"
+                                f"{g}. Попробуйте изменить дату/время или количество гостей."
+                            )
+                    elif code == "TABLE_NOT_FOUND":
+                        if explicit_table:
+                            state["booking_errors"] = [
+                                "Стол не найден в системе бронирования. Выберите другой стол или режим «Любой»."
+                            ]
+                            state["reply"] = "Не удалось подтвердить бронь — см. сообщение в форме ниже."
+                        else:
+                            state["booking_errors"] = []
+                            state["reply"] = "Не удалось найти столик в системе бронирования. Попробуйте изменить параметры."
+                    else:
+                        state["booking_errors"] = []
+                        state["reply"] = "Не удалось создать бронирование. Попробуйте ещё раз."
+                else:
+                    logger.exception("Reservation failed (unexpected exception)")
+                    state["reply"] = "Произошла техническая ошибка. Попробуйте позже."
+                    state["booking_errors"] = []
+
+                # В UI: booking_errors показываются в форме; технические — только в чате.
                 state["booking_pending"] = True
                 state["booking_complete"] = False
-                state["booking_errors"] = booking_errors
                 state["current_node"] = "create_reservation_error"
-                state["reply"] = (
-                    "Не удалось создать бронирование через Toka. "
-                    "Проверьте данные (дату/время, количество гостей, телефон) и попробуйте ещё раз."
-                )
                 state["pipeline_trace"] = _trace_append(
                     state,
                     "create_reservation",
-                    {"ok": False, "error": str(exc)[:500]},
+                    {"ok": False, "code": getattr(exc, "code", None), "error": str(exc)[:500]},
                 )
                 return state
 
@@ -1964,6 +2120,7 @@ class GraphRunner:
         graph.add_node("detect_booking_intent", detect_booking_intent_node)
         graph.add_node("ask_questions", ask_questions_node)
         graph.add_node("confirm_search_plan", confirm_search_plan_node)
+        graph.add_node("ask_search_plan_revision", ask_search_plan_revision_node)
         graph.add_node("extract_specific_restaurant", extract_specific_restaurant_requirements_node)
         graph.add_node("ask_specific_restaurant_questions", ask_specific_restaurant_questions_node)
         graph.add_node("resolve_specific_restaurant", resolve_specific_restaurant_node)
@@ -1990,6 +2147,8 @@ class GraphRunner:
                 return "extract_booking_requirements"
             if s.get("booking_intent_mode") == "specific_restaurant":
                 return "extract_specific_restaurant"
+            if s.get("search_plan_revision_requested"):
+                return "ask_search_plan_revision"
             if not s.get("requirements_complete"):
                 return "ask_questions"
             if not bool(s.get("search_plan_confirmed")):
@@ -2003,12 +2162,14 @@ class GraphRunner:
             path_map={
                 "extract_booking_requirements": "extract_booking_requirements",
                 "extract_specific_restaurant": "extract_specific_restaurant",
+                "ask_search_plan_revision": "ask_search_plan_revision",
                 "ask_questions": "ask_questions",
                 "confirm_search_plan": "confirm_search_plan",
                 "load_afisha_candidate_urls": "load_afisha_candidate_urls",
             },
         )
         graph.add_edge("ask_questions", END)
+        graph.add_edge("ask_search_plan_revision", END)
         graph.add_edge("confirm_search_plan", END)
         graph.add_conditional_edges(
             "extract_specific_restaurant",
@@ -2103,6 +2264,7 @@ class GraphRunner:
             "search_plan_fingerprint": _ctx.get("search_plan_fingerprint")
             if isinstance(_ctx.get("search_plan_fingerprint"), str)
             else None,
+            "search_plan_revision_requested": bool(_ctx.get("search_plan_revision_requested")),
             "booking_pending": bool(graph_state.context.get("booking_pending")) if graph_state.context else False,
             "booking_intent_mode": (
                 str(_ctx.get("booking_intent_mode"))
@@ -2127,6 +2289,11 @@ class GraphRunner:
                 str(x) for x in (_ctx.get("specific_restaurant_missing_fields") or []) if isinstance(x, str)
             ],
             "specific_restaurant_resolved": bool(_ctx.get("specific_restaurant_resolved")),
+            "client_time_zone": (
+                str(_ctx.get("client_time_zone")).strip()[:128]
+                if isinstance(_ctx.get("client_time_zone"), str) and str(_ctx.get("client_time_zone")).strip()
+                else None
+            ),
             "yandex_queries": [],
             "yandex_urls": [],
             "catalog_entries": [],

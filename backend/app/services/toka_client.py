@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from typing import Any, Dict, Optional, Tuple
@@ -8,6 +9,8 @@ from typing import Any, Dict, Optional, Tuple
 import httpx
 
 from ..storage.toka_binding_repository import TokaBindingDTO
+
+logger = logging.getLogger(__name__)
 
 
 class TokaClientError(Exception):
@@ -22,6 +25,16 @@ def _toka_base_url() -> str:
     ).rstrip("/")
 
 
+def _log_toka_token_response(operation: str, resp: httpx.Response) -> None:
+    """Полное тело ответа Toka при выдаче/обновлении токенов (в лог сервера)."""
+    logger.info(
+        "Toka %s: HTTP %s, full response body: %s",
+        operation,
+        resp.status_code,
+        resp.text,
+    )
+
+
 def sync_toka_login(username: str, password: str, base_url: Optional[str] = None) -> Tuple[str, str]:
     """
     Synchronous login for DB seed / migrations only.
@@ -34,6 +47,7 @@ def sync_toka_login(username: str, password: str, base_url: Optional[str] = None
             json={"username": username, "password": password},
             headers={"Accept": "application/json", "Content-Type": "application/json"},
         )
+        _log_toka_token_response("POST /api/users/login (sync seed)", resp)
         if resp.status_code >= 400:
             raise TokaClientError(
                 f"Toka login failed: {resp.status_code} {resp.text[:500]}"
@@ -162,6 +176,7 @@ class TokaBackofficeClient:
             json={"username": self._username, "password": self._password},
             headers=self._json_headers_public(),
         )
+        _log_toka_token_response("POST /api/users/login", resp)
         if resp.status_code >= 400:
             raise TokaClientError(
                 f"Toka login failed: {resp.status_code} {resp.text[:500]}"
@@ -186,6 +201,7 @@ class TokaBackofficeClient:
             json={"refresh_token": self._refresh_token},
             headers=self._json_headers_public(),
         )
+        _log_toka_token_response("POST /api/users/refresh-token", resp)
         if resp.status_code >= 400:
             if self._username and self._password:
                 await self._login_unlocked()
@@ -309,6 +325,28 @@ class TokaBackofficeClient:
             f"/api/units/stores/halls/store/{organization_id}/{store_id}",
         )
 
+    async def get_menu_tree(
+        self, organization_id: str, store_id: str
+    ) -> Dict[str, Any]:
+        return await self.request_json(
+            "GET",
+            f"/api/menus/{organization_id}/stores/{store_id}/menus/tree",
+        )
+
+    async def list_reservations(
+        self,
+        organization_id: str,
+        store_id: str,
+        *,
+        date_str: str,
+    ) -> Dict[str, Any]:
+        """Day-scoped reservation list (Toka requires query param ``date``)."""
+        return await self.request_json(
+            "GET",
+            f"/api/reservations/{organization_id}/{store_id}/reservations",
+            params={"date": date_str},
+        )
+
     async def create_reservation(
         self,
         organization_id: str,
@@ -359,10 +397,15 @@ async def get_toka_backoffice_client_for_binding(dto: TokaBindingDTO) -> TokaBac
 
             return await asyncio.to_thread(sync_load)
 
+        # So refresh failures (expired/revoked DB token) can re-login via /api/users/login
+        # without manual DB edits, same creds as init_db seed (TOKA_USERNAME / TOKA_PASSWORD).
+        toka_user = os.environ.get("TOKA_USERNAME", "").strip()
+        toka_pwd = os.environ.get("TOKA_PASSWORD", "").strip()
+
         client = TokaBackofficeClient(
             _toka_base_url(),
-            "",
-            "",
+            toka_user,
+            toka_pwd,
             refresh_token=dto.refresh_token,
             token_type=dto.token_type,
             binding_id=bid,
@@ -384,3 +427,18 @@ def find_table_capacity(
                     return None
                 return int(cap)
     return None
+
+
+def find_table_title(halls_payload: Dict[str, Any], table_id: str) -> str:
+    """Human-readable table label from halls payload (Toka card fields vary)."""
+    tid = str(table_id)
+    for hall in halls_payload.get("items") or []:
+        for table in hall.get("tables") or []:
+            if str(table.get("id")) != tid:
+                continue
+            for key in ("title", "name", "label"):
+                v = table.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return f"Стол {tid}"
+    return f"Стол {tid}"

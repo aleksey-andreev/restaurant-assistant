@@ -3,21 +3,81 @@ import {
   candidateKey,
   DialogContext,
   getRecommendationList,
-  needsSearchPlanConfirm,
   RestaurantCandidate
 } from "./dialogTypes";
+
+type BookingTableOption = {
+  id: string;
+  title: string;
+  capacity: number;
+  status: string;
+  free_after?: string | null;
+};
+
+function defaultBookingDatetimeLocal(): string {
+  const d = new Date();
+  d.setMinutes(0, 0, 0);
+  d.setHours(d.getHours() + 1);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function isoToDatetimeLocalValue(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** Время освобождения стола для подписи в списке (только часы:минуты, локальное время пользователя). */
+function formatFreeAfterTimeOnly(iso: string | null | undefined): string | null {
+  if (!iso || typeof iso !== "string") return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function tableOptionText(row: BookingTableOption): string {
+  const cap = `мест: ${row.capacity}`;
+  if (row.status === "too_small") {
+    return `${row.title} (${cap}, недостаточно мест для числа гостей)`;
+  }
+  if (row.status === "free") {
+    return `${row.title} (${cap}, свободен)`;
+  }
+  const fa = formatFreeAfterTimeOnly(row.free_after ?? null);
+  return `${row.title} (${cap}, занят${fa ? `; освободится ≈ ${fa}` : ""})`;
+}
+
+/** Convert `datetime-local` value to ISO 8601 with Z (UTC) — assumes local → toISOString. */
+function localDatetimeToIso(local: string): string | null {
+  if (!local) return null;
+  const d = new Date(local);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
 
 type DialogExtrasProps = {
   context: DialogContext | null;
   loading: boolean;
-  onConfirmSearchPlan: () => void;
+  /** Индекс карточки, по которой ушёл запрос select_booking_candidate (без глобального loading). */
+  pendingBookingCandidateIndex?: number | null;
   onSelectCandidate: (index: number) => void;
   onSubmitBooking: (payload: {
     startsAt: string;
     guestCount: number;
     guestName: string;
     guestPhone: string;
+    tableId: string | null;
+    /** Название стола из списка формы; null при выборе «Любой» */
+    tableTitle: string | null;
   }) => void;
+  bookingUiHidden?: boolean;
+  bookingErrorActionsVisible?: boolean;
+  onEditBookingParams?: () => void;
+  onNewBookingThread?: () => void;
 };
 
 function scoreLabel(c: RestaurantCandidate): string | null {
@@ -26,12 +86,21 @@ function scoreLabel(c: RestaurantCandidate): string | null {
   return `${Math.round(v * 100)}%`;
 }
 
+/** Поля с разной длиной текста — фиксированная высота в 2 строки для выравнивания между карточками. */
+function isTwoLineFactLabel(label: string): boolean {
+  return label === "Адрес" || label === "Кухня";
+}
+
 export const DialogExtras: React.FC<DialogExtrasProps> = ({
   context,
   loading,
-  onConfirmSearchPlan,
+  pendingBookingCandidateIndex = null,
   onSelectCandidate,
-  onSubmitBooking
+  onSubmitBooking,
+  bookingUiHidden,
+  bookingErrorActionsVisible,
+  onEditBookingParams,
+  onNewBookingThread
 }) => {
   const list = useMemo(() => getRecommendationList(context), [context]);
   const bookingPending = Boolean(context?.booking_pending);
@@ -39,15 +108,32 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
   const selected = context?.booking_selected_candidate;
   const bookingReq = context?.booking_requirements;
   const reservation = context?.reservation_result;
+  const hidden = Boolean(bookingUiHidden);
+  const showErrorActions = hidden && Boolean(bookingErrorActionsVisible);
 
   const [startsLocal, setStartsLocal] = useState("");
   const [guestCountInput, setGuestCountInput] = useState("2");
   const [guestCountDirty, setGuestCountDirty] = useState(false);
   const [guestName, setGuestName] = useState("");
   const [guestPhone, setGuestPhone] = useState("");
+  const [tableChoice, setTableChoice] = useState("");
+  const [tableOptions, setTableOptions] = useState<BookingTableOption[]>([]);
+  const [tablesLoading, setTablesLoading] = useState(false);
+  const [tablesLoadError, setTablesLoadError] = useState<string | null>(null);
 
   const selectedUrl = selected && typeof selected.url === "string" ? selected.url : null;
   const prefGuestCount = preferredGuestCount(context);
+  const hasSelectedCandidate = Boolean(
+    selected &&
+      ((typeof selected.url === "string" && selected.url.trim()) ||
+        (typeof selected.name === "string" && selected.name.trim()))
+  );
+  const showBooking =
+    Boolean(context) &&
+    bookingPending &&
+    !bookingComplete &&
+    list.length > 0 &&
+    hasSelectedCandidate;
 
   useEffect(() => {
     if (!guestCountDirty) {
@@ -55,21 +141,81 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
     }
   }, [prefGuestCount, guestCountDirty]);
 
+  useEffect(() => {
+    if (!showBooking) return;
+    setStartsLocal(prev => {
+      if (prev.trim()) return prev;
+      const fromCtx = bookingReq?.starts_at;
+      if (typeof fromCtx === "string" && fromCtx.trim()) {
+        const loc = isoToDatetimeLocalValue(fromCtx.trim());
+        if (loc) return loc;
+      }
+      return defaultBookingDatetimeLocal();
+    });
+  }, [showBooking, bookingReq?.starts_at]);
+
+  useEffect(() => {
+    if (!showBooking) return;
+    const tid = bookingReq?.table_id;
+    if (typeof tid === "string" && tid.trim()) {
+      setTableChoice(tid.trim());
+    } else {
+      setTableChoice("");
+    }
+  }, [showBooking, bookingReq?.table_id]);
+
+  useEffect(() => {
+    if (!showBooking) return;
+    const iso = localDatetimeToIso(startsLocal);
+    const gc = Number.parseInt(guestCountInput.trim(), 10);
+    if (!iso || Number.isNaN(gc) || gc < 1) {
+      setTableOptions([]);
+      return;
+    }
+    let cancelled = false;
+    const t = window.setTimeout(() => {
+      void (async () => {
+        setTablesLoading(true);
+        setTablesLoadError(null);
+        try {
+          const params = new URLSearchParams({
+            starts_at: iso,
+            guest_count: String(gc),
+            duration_minutes: "120"
+          });
+          const resp = await fetch(`/api/dialog/booking-table-options?${params}`, {
+            credentials: "include"
+          });
+          if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}`);
+          }
+          const data = (await resp.json()) as { tables?: BookingTableOption[] };
+          const rows = Array.isArray(data.tables) ? data.tables : [];
+          if (!cancelled) {
+            setTableOptions(rows);
+          }
+        } catch {
+          if (!cancelled) {
+            setTableOptions([]);
+            setTablesLoadError("Не удалось загрузить список столов.");
+          }
+        } finally {
+          if (!cancelled) {
+            setTablesLoading(false);
+          }
+        }
+      })();
+    }, 380);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
+  }, [showBooking, startsLocal, guestCountInput]);
+
   if (!context) {
     return null;
   }
 
-  const showSearchPlanConfirm = needsSearchPlanConfirm(context);
-  const hasSelectedCandidate = Boolean(
-    selected &&
-      (
-        (typeof selected.url === "string" && selected.url.trim()) ||
-        (typeof selected.name === "string" && selected.name.trim())
-      )
-  );
-
-  const showBooking =
-    bookingPending && !bookingComplete && list.length > 0 && hasSelectedCandidate;
   const showRecommendations = list.length > 0;
   const confirmation = {
     restaurantName:
@@ -91,7 +237,9 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
     guestName:
       firstNonEmpty(bookingReq?.guest_name, reservation?.guest_name) ?? "—",
     guestPhone:
-      firstNonEmpty(bookingReq?.guest_phone, reservation?.guest_phone) ?? "—"
+      firstNonEmpty(bookingReq?.guest_phone, reservation?.guest_phone) ?? "—",
+    tableTitle:
+      firstNonEmpty(reservationString(reservation, "table_title")) ?? "—"
   };
 
   const handleBookingSubmit = (e: React.FormEvent) => {
@@ -101,193 +249,258 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
     if (!iso) return;
     const parsedGuestCount = Number.parseInt(guestCountInput.trim(), 10);
     if (Number.isNaN(parsedGuestCount) || parsedGuestCount < 1) return;
+    const tid = tableChoice.trim();
+    const row =
+      tid.length > 0 ? tableOptions.find(t => t.id === tid) : undefined;
+    const titleFromList =
+      row && typeof row.title === "string" && row.title.trim()
+        ? row.title.trim()
+        : null;
     onSubmitBooking({
       startsAt: iso,
       guestCount: parsedGuestCount,
       guestName: guestName.trim(),
-      guestPhone: guestPhone.trim()
+      guestPhone: guestPhone.trim(),
+      tableId: tid.length > 0 ? tid : null,
+      tableTitle: titleFromList
     });
   };
 
   return (
     <div className="dialog-extras">
-      {showSearchPlanConfirm && (
-        <div className="search-plan-panel" role="region" aria-label="Подтверждение параметров поиска">
-          <div className="search-plan-panel-title">Параметры поиска</div>
-          <p className="search-plan-panel-text">
-            Проверьте сводку в последнем сообщении ассистента. Если всё верно — запустите поиск.
-          </p>
-          <div className="search-plan-panel-actions">
+      {showErrorActions && (
+        <div className="chat-message chat-message-user chat-message-plan-confirm">
+          <div className="search-plan-panel-actions search-plan-panel-actions--column">
             <button
               type="button"
               className="search-plan-confirm"
+              onClick={onEditBookingParams}
               disabled={loading}
-              onClick={() => onConfirmSearchPlan()}
             >
-              Подтвердить поиск
+              Изменить параметры
+            </button>
+            <button
+              type="button"
+              className="search-plan-confirm"
+              onClick={onNewBookingThread}
+              disabled={loading}
+            >
+              Новый запрос
             </button>
           </div>
         </div>
       )}
 
-      {showRecommendations && (
+      {!hidden && (
         <>
-          <div className="dialog-extras-heading">Варианты</div>
-          <ul className="restaurant-card-list">
-            {list.map((c, i) => {
-              const active = selectedUrl != null && c.url === selectedUrl;
-              const sc = scoreLabel(c);
-              const partySize = context.recommendation_requirements?.party_size;
-              const details = buildCardDetails(c, partySize);
-              return (
-                <li key={candidateKey(c, i)} className="restaurant-card-wrap">
-                  <article
-                    className={`restaurant-card${active ? " restaurant-card--active" : ""}`}
-                  >
-                    <div className="restaurant-card-top">
-                      <h3 className="restaurant-card-title">
-                        {c.name?.trim() || "Ресторан"}
-                      </h3>
-                      {sc && <span className="restaurant-card-score">{sc}</span>}
-                    </div>
-                    {details.length > 0 && (
-                      <ul className="restaurant-card-facts">
-                        {details.map((item, j) => (
-                          <li key={j}>
-                            <span className="restaurant-card-fact-label">{item.label}:</span> {item.value}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                    {typeof c.url === "string" && c.url && (
-                      <a
-                        className="restaurant-card-link"
-                        href={c.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        title="Открыть карточку ресторана на Afisha"
+          {showRecommendations && (
+            <>
+              <ul className="restaurant-card-list">
+                {list.map((c, i) => {
+                  const active = selectedUrl != null && c.url === selectedUrl;
+                  const sc = scoreLabel(c);
+                  const partySize = context.recommendation_requirements?.party_size;
+                  const details = buildCardDetails(c, partySize);
+                  return (
+                    <li key={candidateKey(c, i)} className="restaurant-card-wrap">
+                      <article
+                        className={`restaurant-card${
+                          active ? " restaurant-card--active" : ""
+                        }`}
                       >
-                        Карточка ресторана на Afisha
-                      </a>
-                    )}
-                    {typeof c.toka_capacity_message === "string" &&
-                      c.toka_capacity_message.trim() && (
-                        <p className="restaurant-card-toka-hint" role="note">
-                          {c.toka_capacity_message}
-                        </p>
-                      )}
-                    {bookingPending && !bookingComplete && (
-                      <button
-                        type="button"
-                        className="restaurant-card-select"
-                        disabled={loading || active}
-                        onClick={() => onSelectCandidate(i)}
-                      >
-                        {active ? "Выбран для брони" : "Забронировать здесь"}
-                      </button>
-                    )}
-                  </article>
-                </li>
-              );
-            })}
-          </ul>
+                        <div className="restaurant-card-top">
+                          <h3 className="restaurant-card-title">
+                            {c.name?.trim() || "Ресторан"}
+                          </h3>
+                          {sc && <span className="restaurant-card-score">{sc}</span>}
+                        </div>
+                        {details.length > 0 && (
+                          <ul className="restaurant-card-facts">
+                            {details.map((item, j) => {
+                              const twoLines = isTwoLineFactLabel(item.label);
+                              return (
+                                <li
+                                  key={j}
+                                  className={
+                                    twoLines ? "restaurant-card-fact-row restaurant-card-fact-row--lines2" : undefined
+                                  }
+                                >
+                                  {twoLines ? (
+                                    <div className="restaurant-card-fact-multiline">
+                                      <span className="restaurant-card-fact-label">{item.label}:</span>{" "}
+                                      <span className="restaurant-card-fact-value">{item.value}</span>
+                                    </div>
+                                  ) : (
+                                    <>
+                                      <span className="restaurant-card-fact-label">{item.label}:</span>{" "}
+                                      {item.value}
+                                    </>
+                                  )}
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        )}
+                        {typeof c.url === "string" && c.url && (
+                          <a
+                            className="restaurant-card-link"
+                            href={c.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            title="Открыть карточку ресторана на Afisha"
+                          >
+                            Карточка ресторана на Afisha
+                          </a>
+                        )}
+                        {typeof c.toka_capacity_message === "string" &&
+                          c.toka_capacity_message.trim() && (
+                            <p className="restaurant-card-toka-hint" role="note">
+                              {c.toka_capacity_message}
+                            </p>
+                          )}
+                        {bookingPending && !bookingComplete && (
+                          <button
+                            type="button"
+                            className="restaurant-card-select"
+                            disabled={
+                              loading ||
+                              active ||
+                              pendingBookingCandidateIndex === i
+                            }
+                            onClick={() => onSelectCandidate(i)}
+                          >
+                            {active ? "Выбран для брони" : "Забронировать здесь"}
+                          </button>
+                        )}
+                      </article>
+                    </li>
+                  );
+                })}
+              </ul>
+            </>
+          )}
+
+          {context.booking_errors && context.booking_errors.length > 0 && (
+            <div className="dialog-extras-errors" role="alert">
+              {context.booking_errors.map((err, i) => (
+                <div key={i}>{err}</div>
+              ))}
+            </div>
+          )}
+
+          {showBooking && (
+            <form className="booking-form" onSubmit={handleBookingSubmit}>
+              <div className="booking-form-title">
+                Бронирование «{bookingRestaurantTitle(confirmation.restaurantName)}»
+              </div>
+              <label className="booking-field">
+                <span>Дата и время</span>
+                <input
+                  type="datetime-local"
+                  value={startsLocal}
+                  onChange={e => setStartsLocal(e.target.value)}
+                  required
+                />
+              </label>
+              <label className="booking-field">
+                <span>Стол</span>
+                <select
+                  className="booking-field-select"
+                  value={tableChoice}
+                  onChange={e => setTableChoice(e.target.value)}
+                  disabled={loading || tablesLoading}
+                  aria-busy={tablesLoading}
+                >
+                  <option value="">Любой</option>
+                  {tableOptions.map(row => (
+                    <option key={row.id} value={row.id}>
+                      {tableOptionText(row)}
+                    </option>
+                  ))}
+                </select>
+                {tablesLoading && (
+                  <span className="booking-form-hint" aria-live="polite">
+                    Загрузка списка столов…
+                  </span>
+                )}
+                {tablesLoadError && (
+                  <span className="booking-form-hint" role="alert">
+                    {tablesLoadError}
+                  </span>
+                )}
+              </label>
+              <label className="booking-field">
+                <span>Гостей</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={guestCountInput}
+                  onChange={e => {
+                    setGuestCountDirty(true);
+                    setGuestCountInput(e.target.value);
+                  }}
+                />
+              </label>
+              <label className="booking-field">
+                <span>Имя</span>
+                <input
+                  type="text"
+                  value={guestName}
+                  onChange={e => setGuestName(e.target.value)}
+                  autoComplete="name"
+                  required
+                />
+              </label>
+              <label className="booking-field">
+                <span>Телефон</span>
+                <input
+                  type="tel"
+                  value={guestPhone}
+                  onChange={e => setGuestPhone(e.target.value)}
+                  autoComplete="tel"
+                  required
+                />
+              </label>
+              <button type="submit" className="booking-form-submit" disabled={loading}>
+                Отправить заявку
+              </button>
+            </form>
+          )}
+
+          {bookingComplete && (
+            <div className="booking-confirmation" role="status" aria-live="polite">
+              <div className="booking-confirmation-title">Подтверждение бронирования</div>
+              <div className="booking-confirmation-row">
+                <span>Ресторан</span>
+                <strong>{confirmation.restaurantName}</strong>
+              </div>
+              <div className="booking-confirmation-row">
+                <span>Адрес</span>
+                <strong>{confirmation.restaurantAddress}</strong>
+              </div>
+              <div className="booking-confirmation-row">
+                <span>Время</span>
+                <strong>{confirmation.bookingTime}</strong>
+              </div>
+              <div className="booking-confirmation-row">
+                <span>Стол</span>
+                <strong>{confirmation.tableTitle}</strong>
+              </div>
+              <div className="booking-confirmation-row">
+                <span>Имя</span>
+                <strong>{confirmation.guestName}</strong>
+              </div>
+              <div className="booking-confirmation-row">
+                <span>Телефон</span>
+                <strong>{confirmation.guestPhone}</strong>
+              </div>
+            </div>
+          )}
         </>
-      )}
-
-      {context.booking_errors && context.booking_errors.length > 0 && (
-        <div className="dialog-extras-errors" role="alert">
-          {context.booking_errors.map((err, i) => (
-            <div key={i}>{err}</div>
-          ))}
-        </div>
-      )}
-
-      {showBooking && (
-        <form className="booking-form" onSubmit={handleBookingSubmit}>
-          <div className="booking-form-title">Бронирование</div>
-          <label className="booking-field">
-            <span>Дата и время</span>
-            <input
-              type="datetime-local"
-              value={startsLocal}
-              onChange={e => setStartsLocal(e.target.value)}
-              required
-            />
-          </label>
-          <label className="booking-field">
-            <span>Гостей</span>
-            <input
-              type="number"
-              min={1}
-              value={guestCountInput}
-              onChange={e => {
-                setGuestCountDirty(true);
-                setGuestCountInput(e.target.value);
-              }}
-            />
-          </label>
-          <label className="booking-field">
-            <span>Имя</span>
-            <input
-              type="text"
-              value={guestName}
-              onChange={e => setGuestName(e.target.value)}
-              autoComplete="name"
-              required
-            />
-          </label>
-          <label className="booking-field">
-            <span>Телефон</span>
-            <input
-              type="tel"
-              value={guestPhone}
-              onChange={e => setGuestPhone(e.target.value)}
-              autoComplete="tel"
-              required
-            />
-          </label>
-          <button type="submit" className="booking-form-submit" disabled={loading}>
-            Отправить заявку
-          </button>
-        </form>
-      )}
-
-      {bookingComplete && (
-        <div className="booking-confirmation" role="status" aria-live="polite">
-          <div className="booking-confirmation-title">Подтверждение бронирования</div>
-          <div className="booking-confirmation-row">
-            <span>Ресторан</span>
-            <strong>{confirmation.restaurantName}</strong>
-          </div>
-          <div className="booking-confirmation-row">
-            <span>Адрес</span>
-            <strong>{confirmation.restaurantAddress}</strong>
-          </div>
-          <div className="booking-confirmation-row">
-            <span>Время</span>
-            <strong>{confirmation.bookingTime}</strong>
-          </div>
-          <div className="booking-confirmation-row">
-            <span>Имя</span>
-            <strong>{confirmation.guestName}</strong>
-          </div>
-          <div className="booking-confirmation-row">
-            <span>Телефон</span>
-            <strong>{confirmation.guestPhone}</strong>
-          </div>
-        </div>
       )}
     </div>
   );
 };
-
-/** Convert `datetime-local` value to ISO 8601 with Z (UTC) — assumes local → toISOString. */
-function localDatetimeToIso(local: string): string | null {
-  if (!local) return null;
-  const d = new Date(local);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString();
-}
 
 function preferredGuestCount(context: DialogContext | null): number {
   if (!context) return 2;
@@ -304,6 +517,11 @@ function preferredGuestCount(context: DialogContext | null): number {
     return Math.floor(fromRecommendation);
   }
   return 2;
+}
+
+function bookingRestaurantTitle(name: string): string {
+  const t = name.replace(/[«»]/g, "").trim();
+  return t || "—";
 }
 
 function firstNonEmpty(...values: Array<string | null | undefined>): string | null {

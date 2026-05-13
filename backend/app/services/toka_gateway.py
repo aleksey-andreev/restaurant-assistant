@@ -41,6 +41,11 @@ class TokaGateway:
         data = self._unwrap(await self._agent.toka_get_halls_and_tables(organization_id, store_id))
         return data.get("raw") if isinstance(data.get("raw"), dict) else {"items": list(data.get("halls") or [])}
 
+    async def get_menu_tree(self, organization_id: str, store_id: str) -> Dict[str, Any]:
+        data = self._unwrap(await self._agent.toka_get_menu_tree(organization_id, store_id))
+        raw = data.get("raw")
+        return raw if isinstance(raw, dict) else {}
+
     async def find_capacity(
         self,
         candidate_ref: Dict[str, Any],
@@ -52,6 +57,24 @@ class TokaGateway:
                 candidate_ref=candidate_ref,
                 party_size=party_size,
                 starts_at=starts_at,
+            )
+        )
+
+    async def list_booking_table_options(
+        self,
+        restaurant_ref: Dict[str, Any],
+        starts_at: str,
+        guest_count: int,
+        duration_minutes: int = 120,
+        client_time_zone: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self._unwrap(
+            await self._agent.toka_booking_table_options(
+                restaurant_ref=restaurant_ref,
+                starts_at=starts_at,
+                guest_count=guest_count,
+                duration_minutes=duration_minutes,
+                client_time_zone=client_time_zone,
             )
         )
 
@@ -68,6 +91,7 @@ class TokaGateway:
         table_id: Optional[str] = None,
         organization_id: Optional[str] = None,
         store_id: Optional[str] = None,
+        client_time_zone: Optional[str] = None,
     ) -> Dict[str, Any]:
         return self._unwrap(
             await self._agent.toka_create_reservation(
@@ -82,6 +106,7 @@ class TokaGateway:
                 table_id=table_id,
                 organization_id=organization_id,
                 store_id=store_id,
+                client_time_zone=client_time_zone,
             )
         )
 

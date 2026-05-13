@@ -19,8 +19,9 @@ class _SpecificResolvedGraphRunner:
         messages: List[Dict[str, Any]],
         session_id: Optional[str],
         client_action: Optional[Dict[str, Any]] = None,
+        client_time_zone: Optional[str] = None,
     ) -> Dict[str, Any]:
-        _ = (messages, session_id, client_action)
+        _ = (messages, session_id, client_action, client_time_zone)
         selected = {
             "name": "White Rabbit",
             "url": "https://afisha.ru/moscow/restaurant/white-rabbit/",

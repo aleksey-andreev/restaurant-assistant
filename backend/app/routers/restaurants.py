@@ -109,6 +109,22 @@ async def halls_and_tables(
         _raise_toka_gateway_http(exc)
 
 
+@router.get("/menus/{organization_id}/stores/{store_id}/menus/tree")
+async def menu_tree(
+    gateway: TokaGatewayDep,
+    organization_id: str,
+    store_id: str,
+) -> Dict[str, Any]:
+    """
+    Прокси к Toka: ``GET /api/menus/{org}/stores/{store}/menus/tree``.
+    Учётные данные берутся из строки ``toka_restaurant_bindings`` для пары org/store (или default).
+    """
+    try:
+        return await gateway.get_menu_tree(organization_id, store_id)
+    except TokaGatewayError as exc:
+        _raise_toka_gateway_http(exc)
+
+
 class CreateReservationRequest(BaseModel):
     table_id: str
     starts_at: str = Field(..., description="ISO-8601 start time, e.g. 2026-04-01T19:14:32.987Z")

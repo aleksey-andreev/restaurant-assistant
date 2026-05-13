@@ -5,6 +5,7 @@ toka_restaurant_bindings (fallback row restaurant_name=default).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 from .toka_gateway import TokaGatewayError, get_toka_gateway

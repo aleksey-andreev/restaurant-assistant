@@ -1,6 +1,6 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import { DialogExtras } from "./DialogExtras";
-import { DialogContext } from "./dialogTypes";
+import { DialogContext, shouldShowSearchPlanConfirmButton } from "./dialogTypes";
 
 type Message = {
   role: "user" | "assistant";
@@ -10,7 +10,7 @@ type Message = {
 type DialogResponse = {
   reply: string;
   session_id: string;
-  state?: { context?: DialogContext };
+  state?: { context?: DialogContext; current_node?: string };
 };
 
 type ClientAction =
@@ -22,6 +22,7 @@ type ClientAction =
       guest_count: number;
       guest_name: string;
       guest_phone: string;
+      table_id?: string;
     };
 
 type ChatProps = {
@@ -29,13 +30,34 @@ type ChatProps = {
   onSessionChange: (id: string) => void;
 };
 
+function lastAssistantMessageIndex(messages: Message[]): number {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i].role === "assistant") return i;
+  }
+  return -1;
+}
+
+function browserTimeZone(): string | undefined {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone;
+  } catch {
+    return undefined;
+  }
+}
+
 export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [dialogContext, setDialogContext] = useState<DialogContext | null>(null);
+  /** Last persisted graph node from `/api/dialog` — same source as `current_node` on the server. */
+  const [dialogCurrentNode, setDialogCurrentNode] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [networkError, setNetworkError] = useState<string | null>(null);
+  const [bookingUiHidden, setBookingUiHidden] = useState(false);
+  const [bookingErrorActionsVisible, setBookingErrorActionsVisible] = useState(false);
+  /** Только выбор карточки брони: без глобального loading, чтобы карточки не «мигали». */
+  const [pendingBookingCandidateIndex, setPendingBookingCandidateIndex] = useState<number | null>(null);
 
   const applyDialogResponse = useCallback(
     (
@@ -48,6 +70,11 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
       }
       const ctx = data.state?.context ?? null;
       setDialogContext(ctx);
+      const node =
+        data.state && typeof data.state.current_node === "string"
+          ? data.state.current_node
+          : null;
+      setDialogCurrentNode(node);
       if (options?.suppressAssistantReply) {
         setMessages(userMessages);
         return;
@@ -69,6 +96,10 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
       if (clientAction) {
         body.client_action = clientAction;
       }
+      const tz = browserTimeZone();
+      if (tz) {
+        body.client_time_zone = tz;
+      }
       const resp = await fetch("/api/dialog", {
         method: "POST",
         headers: {
@@ -82,6 +113,7 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
       }
       const data = (await resp.json()) as DialogResponse;
       applyDialogResponse(data, nextMessages, options);
+      return data;
     },
     [applyDialogResponse]
   );
@@ -90,10 +122,15 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
     if (loading || resetting) return;
     setResetting(true);
     setNetworkError(null);
+    setBookingUiHidden(false);
+    setBookingErrorActionsVisible(false);
+    setPendingBookingCandidateIndex(null);
     try {
       const resp = await fetch("/api/dialog/session/new", {
         method: "POST",
-        credentials: "include"
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_time_zone: browserTimeZone() })
       });
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
@@ -101,6 +138,7 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
       const data = (await resp.json()) as { session_id: string };
       setMessages([]);
       setDialogContext(null);
+      setDialogCurrentNode(null);
       setInput("");
       onSessionChange(data.session_id);
     } catch {
@@ -127,8 +165,8 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
   };
 
   const selectCandidate = async (index: number) => {
-    if (loading) return;
-    setLoading(true);
+    if (loading || pendingBookingCandidateIndex !== null) return;
+    setPendingBookingCandidateIndex(index);
     setNetworkError(null);
     try {
       await postDialog(messages, {
@@ -138,45 +176,178 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
     } catch {
       setNetworkError("Не удалось выбрать ресторан для бронирования.");
     } finally {
-      setLoading(false);
+      setPendingBookingCandidateIndex(null);
     }
   };
 
   const confirmSearchPlan = async () => {
     if (loading) return;
+    const prevMessages = messages;
+    const withConfirm: Message[] = [
+      ...messages,
+      { role: "user", content: "Подтверждаю" }
+    ];
+    setMessages(withConfirm);
     setLoading(true);
     setNetworkError(null);
     try {
-      await postDialog(messages, { type: "confirm_search_plan" });
+      await postDialog(withConfirm, { type: "confirm_search_plan" });
     } catch {
+      setMessages(prevMessages);
       setNetworkError("Не удалось подтвердить параметры поиска.");
     } finally {
       setLoading(false);
     }
   };
 
+  const lastAssistantIndex = useMemo(() => lastAssistantMessageIndex(messages), [messages]);
+
   const submitBooking = async (payload: {
     startsAt: string;
     guestCount: number;
     guestName: string;
     guestPhone: string;
+    tableId: string | null;
+    tableTitle: string | null;
   }) => {
     if (loading) return;
     setLoading(true);
     setNetworkError(null);
+    setBookingUiHidden(true);
+    setBookingErrorActionsVisible(false);
+
+    const restaurantName =
+      dialogContext?.booking_selected_candidate?.name?.trim() ||
+      "Ресторан";
+    const restaurantAddress =
+      dialogContext?.booking_selected_candidate?.address?.trim() || "—";
+    const tableUserLine = (() => {
+      if (!payload.tableId) return "любой";
+      const t = payload.tableTitle?.trim();
+      if (t) return t;
+      return `стол (id: ${payload.tableId})`;
+    })();
+    const userBookingMessage = [
+      `Запрос на бронь в ресторане «${restaurantName}».`,
+      formatBookingDetailBullets({
+        address: restaurantAddress,
+        startsAtIso: payload.startsAt,
+        guestCount: payload.guestCount,
+        table: tableUserLine,
+        guestName: payload.guestName,
+        guestPhone: payload.guestPhone
+      })
+    ].join("\n");
+
+    const newMessages = [
+      ...messages,
+      {
+        role: "user" as const,
+        content: userBookingMessage
+      }
+    ];
+    setMessages(newMessages);
     try {
-      await postDialog(messages, {
+      const submitAction: ClientAction = {
         type: "submit_booking",
         starts_at: payload.startsAt,
         guest_count: payload.guestCount,
         guest_name: payload.guestName,
         guest_phone: payload.guestPhone
-      }, { suppressAssistantReply: true });
+      };
+      if (payload.tableId && payload.tableId.trim()) {
+        submitAction.table_id = payload.tableId.trim();
+      }
+      const data = await postDialog(newMessages, submitAction, { suppressAssistantReply: true });
+      const ctx = data.state?.context ?? null;
+      const bookingComplete = Boolean(ctx?.booking_complete);
+
+      if (bookingComplete) {
+        const res = ctx?.reservation_result ?? null;
+        const req = ctx?.booking_requirements ?? {};
+        const selected = ctx?.booking_selected_candidate ?? null;
+
+        const rName =
+          firstNonEmptyStr(selected?.name) ??
+          firstNonEmptyStr(res?.restaurant_name, res?.name) ??
+          "—";
+        const rAddress =
+          firstNonEmptyStr(selected?.address) ??
+          firstNonEmptyStr(res?.restaurant_address, res?.address) ??
+          "—";
+        const timeRaw =
+          (typeof res?.starts_at === "string" ? res?.starts_at : null) ??
+          (typeof req?.starts_at === "string" ? req.starts_at : null) ??
+          payload.startsAt;
+        const gName =
+          firstNonEmptyStr(res?.guest_name) ?? firstNonEmptyStr(req?.guest_name) ?? payload.guestName;
+        const gPhone =
+          firstNonEmptyStr(res?.guest_phone) ??
+          firstNonEmptyStr(req?.guest_phone) ??
+          payload.guestPhone;
+        const tableTitle =
+          firstNonEmptyStr(
+            typeof res?.table_title === "string" ? res.table_title : undefined
+          ) ?? null;
+        const gcConfirm =
+          typeof res?.guest_count === "number" && Number.isFinite(res.guest_count)
+            ? Math.floor(res.guest_count)
+            : typeof req?.guest_count === "number" && Number.isFinite(req.guest_count)
+              ? Math.floor(req.guest_count)
+              : payload.guestCount;
+        const tableLineConfirm = tableTitle ?? "—";
+        const assistantMessage = [
+          `Бронь подтверждена в ресторане «${rName}».`,
+          formatBookingDetailBullets({
+            address: rAddress,
+            startsAtIso: timeRaw,
+            guestCount: gcConfirm,
+            table: tableLineConfirm,
+            guestName: gName || "—",
+            guestPhone: gPhone || "—"
+          })
+        ].join("\n");
+
+        setBookingUiHidden(true);
+        setBookingErrorActionsVisible(false);
+        setMessages([...newMessages, { role: "assistant", content: assistantMessage }]);
+      } else {
+        const errs = ctx?.booking_errors;
+        const hasFormErrors = Array.isArray(errs) && errs.length > 0;
+        if (hasFormErrors) {
+          setBookingUiHidden(false);
+          setBookingErrorActionsVisible(false);
+        } else {
+          setBookingUiHidden(true);
+          setBookingErrorActionsVisible(true);
+        }
+        const assistantMessage = data.reply || "Не удалось создать бронирование.";
+        setMessages([...newMessages, { role: "assistant", content: assistantMessage }]);
+      }
     } catch {
-      setNetworkError("Не удалось отправить заявку на бронирование.");
+      // Падение запроса — это техническая проблема со стороны сети/сервера:
+      // показываем общее сообщение и даём кнопки, т.к. пользователь не получил подтверждения.
+      setBookingUiHidden(true);
+      setBookingErrorActionsVisible(true);
+      setMessages([
+        ...newMessages,
+        {
+          role: "assistant",
+          content: "Произошла техническая ошибка. Попробуйте позже."
+        }
+      ]);
+      setNetworkError("Сервер временно недоступен. Проверьте подключение и повторите попытку.");
     } finally {
       setLoading(false);
     }
+  };
+
+  /** Только UI: снова показать карточки и форму, без запроса к API (LLM не вызывается). */
+  const editBookingParams = () => {
+    if (loading) return;
+    setBookingUiHidden(false);
+    setBookingErrorActionsVisible(false);
+    setNetworkError(null);
   };
 
   return (
@@ -202,14 +373,51 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
               {networkError}
             </div>
           )}
-          {messages.map((m, idx) => (
-            <div
-              key={idx}
-              className={`chat-message chat-message-${m.role}`}
-            >
-              <div className="chat-bubble">{m.content}</div>
-            </div>
-          ))}
+          {messages.map((m, idx) => {
+            const showPlanConfirm =
+              m.role === "assistant" &&
+              idx === lastAssistantIndex &&
+              shouldShowSearchPlanConfirmButton(dialogContext, dialogCurrentNode) &&
+              !loading;
+            if (m.role === "assistant" && showPlanConfirm) {
+              return (
+                <React.Fragment key={idx}>
+                  <div className="chat-message chat-message-assistant">
+                    <div className="chat-assistant-stack">
+                      <div className="chat-bubble">{m.content}</div>
+                    </div>
+                  </div>
+                  <div className="chat-message chat-message-user chat-message-plan-confirm">
+                    <div className="search-plan-panel-actions">
+                      <button
+                        type="button"
+                        className="search-plan-confirm"
+                        disabled={loading}
+                        onClick={() => void confirmSearchPlan()}
+                        aria-label="Подтвердить параметры поиска"
+                      >
+                        Подтвердить
+                      </button>
+                    </div>
+                  </div>
+                </React.Fragment>
+              );
+            }
+            return (
+              <div
+                key={idx}
+                className={`chat-message chat-message-${m.role}`}
+              >
+                {m.role === "assistant" ? (
+                  <div className="chat-assistant-stack">
+                    <div className="chat-bubble">{m.content}</div>
+                  </div>
+                ) : (
+                  <div className="chat-bubble">{m.content}</div>
+                )}
+              </div>
+            );
+          })}
           {loading && (
             <div className="chat-message chat-message-assistant">
               <div className="chat-bubble chat-bubble-loading">
@@ -217,15 +425,19 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
               </div>
             </div>
           )}
-        </div>
 
-        <DialogExtras
-          context={dialogContext}
-          loading={loading}
-          onConfirmSearchPlan={confirmSearchPlan}
-          onSelectCandidate={selectCandidate}
-          onSubmitBooking={submitBooking}
-        />
+          <DialogExtras
+            context={dialogContext}
+            loading={loading}
+            pendingBookingCandidateIndex={pendingBookingCandidateIndex}
+            onSelectCandidate={selectCandidate}
+            onSubmitBooking={submitBooking}
+            bookingUiHidden={bookingUiHidden}
+            bookingErrorActionsVisible={bookingErrorActionsVisible}
+            onEditBookingParams={editBookingParams}
+            onNewBookingThread={() => void startNewThread()}
+          />
+        </div>
       </div>
 
       <div className="chat-input-row">
@@ -255,3 +467,45 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
     </section>
   );
 };
+
+function firstNonEmptyStr(...values: Array<string | null | undefined>): string | null {
+  for (const v of values) {
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+/** Локальная дата и время для отображения пользователю; время только часы:минуты (например 20:00). */
+function formatLocalDateTimeNoSeconds(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const dateStr = d.toLocaleDateString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric"
+  });
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${dateStr}, ${hh}:${mm}`;
+}
+
+/** Единый блок полей брони (для сообщения пользователя и ответа ассистента). */
+function formatBookingDetailBullets(p: {
+  address: string;
+  startsAtIso: string;
+  guestCount: number;
+  table: string;
+  guestName: string;
+  guestPhone: string;
+}): string {
+  const when = formatLocalDateTimeNoSeconds(p.startsAtIso);
+  return [
+    `- Адрес: ${p.address}`,
+    `- Дата и время: ${when}`,
+    `- Гостей: ${p.guestCount}`,
+    `- Стол: ${p.table}`,
+    `- Имя: ${p.guestName}`,
+    `- Телефон: ${p.guestPhone}`
+  ].join("\n");
+}

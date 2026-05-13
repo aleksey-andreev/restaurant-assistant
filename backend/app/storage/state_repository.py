@@ -70,6 +70,24 @@ class StateRepository:
 
             db.commit()
 
+    async def merge_context_patch(self, session_id: str, patch: Dict[str, Any]) -> None:
+        """Merge ``patch`` into persisted graph context (creates row if missing)."""
+        if not patch:
+            return
+        with self._session_maker() as db:  # type: OrmSession
+            row = (
+                db.query(GraphState)
+                .filter(GraphState.session_id == session_id)
+                .one_or_none()
+            )
+            if row is None:
+                row = GraphState(session_id=session_id, history=[], context={})
+                db.add(row)
+            ctx = dict(row.context or {})
+            ctx.update(patch)
+            row.context = ctx
+            db.commit()
+
     async def update_current_node_and_context(
         self,
         session_id: str,

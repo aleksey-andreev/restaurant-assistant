@@ -176,7 +176,8 @@ body {
 }
 
 .chat-messages {
-  flex: 0 0 auto;
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 0.65rem;
@@ -217,6 +218,7 @@ body {
   background: var(--brand-primary);
   color: var(--brand-contrast);
   border-bottom-right-radius: 6px;
+  white-space: pre-wrap;
 }
 
 .chat-message-assistant .chat-bubble {
@@ -337,46 +339,40 @@ body {
 }
 
 .dialog-extras {
-  margin-top: 0.2rem;
-  padding: 0.85rem 0.25rem 0;
-  border-top: 1px solid var(--border-default);
+  margin-top: 0.15rem;
+  padding: 0.35rem 0 0;
+  border-top: none;
+  width: 100%;
+  min-width: 0;
 }
 
-.dialog-extras-heading {
-  font-size: 0.75rem;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--text-muted);
-  margin-bottom: 0.52rem;
-  font-weight: 700;
+.chat-assistant-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.55rem;
+  max-width: 85%;
 }
 
-.search-plan-panel {
-  margin-bottom: 0.95rem;
-  padding: 0.82rem;
-  border-radius: var(--radius-md);
-  background: var(--bg-soft-accent);
-  border: 1px solid #ffd8bf;
+.chat-assistant-stack > .chat-bubble {
+  max-width: 100%;
 }
 
-.search-plan-panel-title {
-  font-size: 0.86rem;
-  font-weight: 700;
-  color: var(--text-primary);
-  margin-bottom: 0.3rem;
-}
-
-.search-plan-panel-text {
-  margin: 0 0 0.68rem;
-  font-size: 0.84rem;
-  line-height: 1.42;
-  color: var(--text-secondary);
+/* Plan confirm button: same horizontal alignment as user bubbles */
+.chat-message-plan-confirm {
+  margin-top: -0.25rem;
 }
 
 .search-plan-panel-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
+}
+
+.search-plan-panel-actions--column {
+  flex-direction: column;
+  align-items: flex-end;
+  flex-wrap: nowrap;
 }
 
 .search-plan-confirm,
@@ -397,12 +393,25 @@ body {
   margin: 0;
   padding: 0;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: stretch;
   gap: 0.68rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x;
+  scroll-snap-type: x proximity;
+  padding-bottom: 0.35rem;
 }
 
 .restaurant-card-wrap {
   margin: 0;
+  flex: 0 0 auto;
+  width: min(22rem, 85vw);
+  scroll-snap-align: start;
+  display: flex;
+  flex-direction: column;
+  align-self: stretch;
 }
 
 .restaurant-card {
@@ -412,6 +421,10 @@ body {
   padding: 0.75rem 0.8rem;
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 100%;
+  width: 100%;
+  box-sizing: border-box;
   gap: 0.45rem;
   box-shadow: var(--shadow-sm);
   font-size: 0.92rem;
@@ -421,7 +434,8 @@ body {
 
 .restaurant-card--active {
   border-color: #ffbe9d;
-  box-shadow: 0 0 0 2px #ffd7c5;
+  /* Кольцо выделения внутри карточки — высота и отступы не меняются, нет обрезки у overflow-x */
+  box-shadow: var(--shadow-sm), inset 0 0 0 2px #ffd7c5;
 }
 
 .restaurant-card-top {
@@ -470,6 +484,23 @@ body {
   margin-top: 0.08rem;
 }
 
+/* Адрес и кухня: одна высота на 2 строки во всех карточках; длинный текст обрезается с многоточием. */
+.restaurant-card-facts li.restaurant-card-fact-row--lines2 .restaurant-card-fact-multiline {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  word-break: break-word;
+  line-height: 1.45;
+  min-height: 2.9em;
+  min-height: calc(2lh);
+}
+
+.restaurant-card-fact-value {
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
 .restaurant-card-fact-label {
   color: var(--text-primary);
   font-weight: 500;
@@ -498,7 +529,9 @@ body {
 
 .restaurant-card-select {
   align-self: flex-start;
-  margin-top: 0.25rem;
+  margin-top: auto;
+  min-height: 2.35rem;
+  box-sizing: border-box;
 }
 
 .dialog-extras-errors {
@@ -556,6 +589,20 @@ body {
   font-size: 0.92rem;
   font-weight: 500;
   font-family: inherit;
+}
+
+.booking-field select,
+.booking-field-select {
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  padding: 0.46rem 0.55rem;
+  background: #ffffff;
+  color: var(--text-primary);
+  font-size: 0.92rem;
+  font-weight: 500;
+  font-family: inherit;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .booking-confirmation {

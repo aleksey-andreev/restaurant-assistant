@@ -23,8 +23,9 @@ class _SpecificAmbiguousGraphRunner:
         messages: List[Dict[str, Any]],
         session_id: Optional[str],
         client_action: Optional[Dict[str, Any]] = None,
+        client_time_zone: Optional[str] = None,
     ) -> Dict[str, Any]:
-        _ = (messages, session_id)
+        _ = (messages, session_id, client_time_zone)
         candidates = [
             _make_candidate("Сыроварня на Красном Октябре", "https://afisha.ru/u1", "Берсеневская наб."),
             _make_candidate("Сыроварня на Усачевском", "https://afisha.ru/u2", "ул. Усачева"),

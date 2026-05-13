@@ -13,8 +13,8 @@ from app.routers import dialog
 
 
 class _StubGraphRunner:
-    async def run_dialog(self, messages, session_id, client_action=None):
-        _ = (messages, session_id, client_action)
+    async def run_dialog(self, messages, session_id, client_action=None, client_time_zone=None):
+        _ = (messages, session_id, client_action, client_time_zone)
         return {
             "reply": "ok",
             "session_id": "s-1",
