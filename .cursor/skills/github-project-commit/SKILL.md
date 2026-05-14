@@ -89,7 +89,7 @@ After commit, report:
 
 ### VM update commands (always append)
 
-After the items above, **always** add a short block the user can run **on the VM** to refresh the deployed app. Assume this repository: production-style update is `deploy/update-vm.sh` (git pull `main`, optional DB restore from dump, `docker compose -f docker-compose.prod.yml` rebuild/up).
+After the items above, **always** add a short block the user can run **on the VM** to refresh the deployed app. Assume this repository: production-style update is `deploy/update-vm.sh` (git pull `main`, `docker compose -f docker-compose.prod.yml` rebuild/up; DB restore from dump only with `--restore-db`).
 
 Use **placeholders** the user can replace (`USER`, `HOST`, `REPO_DIR`). Do not invent real hosts or paths from the user’s machine unless they were stated in the chat.
 
@@ -104,8 +104,8 @@ ssh USER@HOST
 cd REPO_DIR
 bash deploy/update-vm.sh
 
-# Same script but skip DB restore (code/config only):
-SKIP_DB_RESTORE=1 bash deploy/update-vm.sh
+# Same script but also restore PostgreSQL from the repo dump:
+bash deploy/update-vm.sh --restore-db
 ```
 
 If the user has no VM or uses another rollout, say so in one line and still give the closest equivalent (e.g. only `docker compose` up) or point to skill `remote-vm-app-updates` for a custom SSH checklist.

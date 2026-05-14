@@ -3,14 +3,14 @@ set -euo pipefail
 
 # One-shot VM update:
 # 1) Pull latest main
-# 2) Restore DB from committed dump (optional)
+# 2) Optionally restore DB from dump (--restore-db)
 # 3) Rebuild and restart docker compose stack
 #
 # Run from anywhere:
-#   bash deploy/update-vm.sh
+#   bash deploy/update-vm.sh              # git + docker only (no DB restore)
+#   bash deploy/update-vm.sh --restore-db # also pg_restore from dump
 #
-# Optional env:
-#   SKIP_DB_RESTORE=1   # skip pg_restore step
+# Optional env (restore step only):
 #   CLEAN_TARGET=1      # passed to restore script (default: 1)
 #   DUMP_FILE=...       # custom dump path (default: backend/db_dumps/restaurant_assistant_no_session_logs.dump)
 #   ENV_FILE=...        # custom .env path for restore script
@@ -22,8 +22,50 @@ cd "${ROOT_DIR}"
 
 COMPOSE_FILE="docker-compose.prod.yml"
 DUMP_FILE="${DUMP_FILE:-backend/db_dumps/restaurant_assistant_no_session_logs.dump}"
-SKIP_DB_RESTORE="${SKIP_DB_RESTORE:-0}"
+RESTORE_DB=0
 export CLEAN_TARGET="${CLEAN_TARGET:-1}"
+
+usage() {
+  cat <<'EOF'
+Usage: bash deploy/update-vm.sh [options]
+
+  Default: pull main from origin, rebuild and restart docker compose (no DB dump).
+
+Options:
+  --restore-db     Restore PostgreSQL from DUMP_FILE (see env below).
+  --dump-file PATH Override dump path for this run (same as DUMP_FILE=...).
+  -h, --help       Show this help.
+
+Environment (restore only):
+  DUMP_FILE, CLEAN_TARGET, ENV_FILE, TARGET_DATABASE_URL
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --restore-db)
+      RESTORE_DB=1
+      shift
+      ;;
+    --dump-file)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --dump-file requires a path." >&2
+        exit 1
+      fi
+      DUMP_FILE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
 
 if ! command -v git >/dev/null 2>&1; then
   echo "ERROR: git not found."
@@ -39,7 +81,7 @@ git fetch origin
 git checkout main
 git pull --ff-only origin main
 
-if [[ "${SKIP_DB_RESTORE}" != "1" ]]; then
+if [[ "${RESTORE_DB}" -eq 1 ]]; then
   if [[ ! -f "${DUMP_FILE}" ]]; then
     echo "ERROR: dump file not found: ${DUMP_FILE}"
     exit 1
@@ -47,7 +89,7 @@ if [[ "${SKIP_DB_RESTORE}" != "1" ]]; then
   echo "==> Restoring database from dump: ${DUMP_FILE}"
   DUMP_FILE="${DUMP_FILE}" bash backend/scripts/transfer_db_without_session_logs.sh restore
 else
-  echo "==> SKIP_DB_RESTORE=1, database restore skipped"
+  echo "==> Database restore skipped (pass --restore-db to restore from dump)"
 fi
 
 echo "==> Rebuilding and restarting docker stack"
