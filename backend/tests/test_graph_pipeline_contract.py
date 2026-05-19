@@ -25,13 +25,13 @@ class GraphPipelineContractTest(unittest.TestCase):
         metro = format_search_plan_summary(
             {**base, "location": {"type": "metro", "value": "Киевская"}}
         )
-        self.assertIn("- Локация: метро: Киевская", metro)
+        self.assertIn("- Локация: метро Киевская", metro)
         self.assertNotIn("metro:", metro)
 
         area = format_search_plan_summary(
             {**base, "location": {"type": "area", "value": "Хамовники"}}
         )
-        self.assertIn("- Локация: район: Хамовники", area)
+        self.assertIn("- Локация: район Хамовники", area)
         self.assertNotIn("area:", area)
 
 

@@ -5,6 +5,15 @@ import {
   PreorderCartLine,
   shouldShowSearchPlanConfirmButton
 } from "./dialogTypes";
+import {
+  buildReceiptPayload,
+  formatBookingDetailBullets,
+  formatLocalDateTimeNoSeconds,
+  formatReceiptSaveSuccessMessage,
+  isSaveReceiptUserText,
+  shouldOfferSaveReceipt
+} from "../lib/receiptData";
+import { generateBookingReceiptPdf } from "../lib/generateBookingReceiptPdf";
 import { MenuPreorderCard } from "./MenuPreorderCard";
 
 type Message = {
@@ -35,7 +44,8 @@ type ClientAction =
   | { type: "preorder_llm_pick"; preferences_text?: string | null }
   | { type: "preorder_submit_cart"; lines: PreorderCartLine[] }
   | { type: "preorder_confirm_order" }
-  | { type: "preorder_amend" };
+  | { type: "preorder_amend" }
+  | { type: "save_receipt" };
 
 type ChatProps = {
   sessionId: string | null;
@@ -160,9 +170,49 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
     }
   };
 
+  const saveReceiptFlow = useCallback(
+    async (userText: string) => {
+      if (loading || !shouldOfferSaveReceipt(dialogContext)) return;
+      const payload = buildReceiptPayload(dialogContext, messages);
+      if (!payload) {
+        setNetworkError("Нет данных для сохранения PDF.");
+        return;
+      }
+      const trimmed = userText.trim() || "Сохрани";
+      const newMessages: Message[] = [...messages, { role: "user", content: trimmed }];
+      setMessages(newMessages);
+      setLoading(true);
+      setNetworkError(null);
+      try {
+        const filename = await generateBookingReceiptPdf(payload);
+        const data = await postDialog(newMessages, { type: "save_receipt" }, {
+          suppressAssistantReply: true
+        });
+        if (data.session_id && data.session_id !== sessionId) {
+          onSessionChange(data.session_id);
+        }
+        const ctx = data.state?.context ?? null;
+        setDialogContext(ctx);
+        const successText = formatReceiptSaveSuccessMessage(filename);
+        setMessages([...newMessages, { role: "assistant", content: successText }]);
+      } catch {
+        setNetworkError("Не удалось сформировать PDF. Попробуйте ещё раз.");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [dialogContext, loading, messages, onSessionChange, postDialog, sessionId]
+  );
+
   const send = async () => {
     if (!input.trim()) return;
-    const newMessages = [...messages, { role: "user" as const, content: input }];
+    const text = input.trim();
+    if (shouldOfferSaveReceipt(dialogContext) && isSaveReceiptUserText(text)) {
+      setInput("");
+      await saveReceiptFlow(text);
+      return;
+    }
+    const newMessages = [...messages, { role: "user" as const, content: text }];
     setMessages(newMessages);
     setInput("");
     setLoading(true);
@@ -430,6 +480,11 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
               idx === lastAssistantIndex &&
               shouldShowSearchPlanConfirmButton(dialogContext, dialogCurrentNode) &&
               !loading;
+            const showSaveReceipt =
+              m.role === "assistant" &&
+              idx === lastAssistantIndex &&
+              shouldOfferSaveReceipt(dialogContext) &&
+              !loading;
             if (m.role === "assistant" && showPlanConfirm) {
               return (
                 <React.Fragment key={idx}>
@@ -448,6 +503,30 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
                         aria-label="Подтвердить параметры поиска"
                       >
                         Подтвердить
+                      </button>
+                    </div>
+                  </div>
+                </React.Fragment>
+              );
+            }
+            if (m.role === "assistant" && showSaveReceipt) {
+              return (
+                <React.Fragment key={idx}>
+                  <div className="chat-message chat-message-assistant">
+                    <div className="chat-assistant-stack">
+                      <div className="chat-bubble">{m.content}</div>
+                    </div>
+                  </div>
+                  <div className="chat-message chat-message-user chat-message-plan-confirm">
+                    <div className="chat-quick-actions">
+                      <button
+                        type="button"
+                        className="chat-quick-action"
+                        disabled={loading}
+                        onClick={() => void saveReceiptFlow("Сохрани")}
+                        aria-label="Сохранить бронь и предзаказ в PDF"
+                      >
+                        Сохранить
                       </button>
                     </div>
                   </div>
@@ -601,37 +680,3 @@ function firstNonEmptyStr(...values: Array<string | null | undefined>): string |
   return null;
 }
 
-/** Локальная дата и время для отображения пользователю; время только часы:минуты (например 20:00). */
-function formatLocalDateTimeNoSeconds(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const dateStr = d.toLocaleDateString("ru-RU", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric"
-  });
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  return `${dateStr}, ${hh}:${mm}`;
-}
-
-/** Единый блок полей брони (для сообщения пользователя и ответа ассистента). */
-function formatBookingDetailBullets(p: {
-  address: string;
-  startsAtIso: string;
-  guestCount: number;
-  table: string;
-  guestName: string;
-  guestPhone: string;
-}): string {
-  const when = formatLocalDateTimeNoSeconds(p.startsAtIso);
-  return [
-    `- Адрес: ${p.address}`,
-    `- Дата и время: ${when}`,
-    `- Гостей: ${p.guestCount}`,
-    `- Стол: ${p.table}`,
-    `- Имя: ${p.guestName}`,
-    `- Телефон: ${p.guestPhone}`
-  ].join("\n");
-}

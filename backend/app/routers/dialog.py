@@ -66,6 +66,10 @@ class PreorderAmendAction(BaseModel):
     type: Literal["preorder_amend"] = "preorder_amend"
 
 
+class SaveReceiptAction(BaseModel):
+    type: Literal["save_receipt"] = "save_receipt"
+
+
 DialogClientAction = Annotated[
     Union[
         SelectBookingCandidateAction,
@@ -78,6 +82,7 @@ DialogClientAction = Annotated[
         PreorderSubmitCartAction,
         PreorderConfirmOrderAction,
         PreorderAmendAction,
+        SaveReceiptAction,
     ],
     Field(discriminator="type"),
 ]

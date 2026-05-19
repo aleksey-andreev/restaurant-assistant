@@ -3,6 +3,7 @@
 
 Usage from repo root (with ``DATABASE_URL`` in ``.env``):
 
+  python3 backend/scripts/seed_city_districts.py msk --fetch-wikipedia --replace
   python3 backend/scripts/seed_city_districts.py msk --district \"Тверской район\" \"Хамовники\"
   python3 backend/scripts/seed_city_districts.py voronezh --file data/vrn_districts.txt
   python3 backend/scripts/seed_city_districts.py msk --json-file data/msk.json --replace
@@ -40,6 +41,15 @@ def _gather_labels(ns: argparse.Namespace) -> List[str]:
                     v = it.get("label") or it.get("name") or it.get("district")
                     if isinstance(v, str) and v.strip():
                         labels.append(v.strip())
+    if ns.fetch_wikipedia:
+        slug = ns.city_slug.strip().lower()
+        if slug == "msk":
+            from app.services.metro_catalog_fetch import fetch_msk_districts_from_wikipedia
+
+            labels.extend(fetch_msk_districts_from_wikipedia())
+        else:
+            print("--fetch-wikipedia is only implemented for msk", file=sys.stderr)
+            sys.exit(2)
     return labels
 
 
@@ -71,6 +81,11 @@ def main() -> None:
         action="store_true",
         help="Delete existing rows for this city_slug before upsert",
     )
+    parser.add_argument(
+        "--fetch-wikipedia",
+        action="store_true",
+        help="Fetch district list from ru.wikipedia (msk: category Районы Москвы)",
+    )
     ns = parser.parse_args()
     slug = str(ns.city_slug or "").strip().lower()
     if not slug:
@@ -79,7 +94,7 @@ def main() -> None:
 
     labels = _gather_labels(ns)
     if not labels:
-        print("No labels: pass --district, --file and/or --json-file", file=sys.stderr)
+        print("No labels: pass --fetch-wikipedia, --district, --file and/or --json-file", file=sys.stderr)
         sys.exit(1)
 
     try:

@@ -84,6 +84,22 @@ class CityDistrict(Base):
     )
 
 
+class CityMetroStation(Base):
+    """Canonical metro station names per Afisha city_slug (seeded from external sources)."""
+
+    __tablename__ = "city_metro_stations"
+    __table_args__ = (UniqueConstraint("city_slug", "station_norm", name="uq_city_metro_stations_city_norm"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    city_slug: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    station_label: Mapped[str] = mapped_column(String(256), nullable=False)
+    station_norm: Mapped[str] = mapped_column(String(256), nullable=False)
+    source: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
 class TokaRestaurantBinding(Base):
     """
     Toka Backoffice credentials per restaurant key (normalized name) or explicit default row.

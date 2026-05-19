@@ -148,6 +148,25 @@ def _migrate_afisha_restaurants_columns(engine) -> None:
                 "ON CONFLICT (city_slug, district_norm) DO NOTHING"
             )
         )
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS city_metro_stations ("
+                "id SERIAL PRIMARY KEY, "
+                "city_slug VARCHAR(64) NOT NULL, "
+                "station_label VARCHAR(256) NOT NULL, "
+                "station_norm VARCHAR(256) NOT NULL, "
+                "source VARCHAR(64), "
+                "created_at TIMESTAMP NOT NULL DEFAULT NOW(), "
+                "CONSTRAINT uq_city_metro_stations_city_norm UNIQUE (city_slug, station_norm)"
+                ")"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_city_metro_stations_city_slug "
+                "ON city_metro_stations (city_slug)"
+            )
+        )
 
 
 def _seed_toka_default_binding(engine) -> None:

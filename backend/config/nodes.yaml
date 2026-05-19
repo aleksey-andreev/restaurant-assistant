@@ -3,12 +3,37 @@ nodes:
     # base_url можно не указывать, если используется CLOUDRU_FOUNDATION_MODELS_URL
     api_key_env: "CLOUDRU_FOUNDATION_MODELS_API_KEY"
     model: "ai-sage/GigaChat3-10B-A1.8B"
-    max_tokens: 2500
+    max_tokens: 10000
     temperature: 0.5
     presence_penalty: 0.0
     top_p: 0.95
     system_prompt: >
       Ты – умный ассистент по выбору ресторана.
       Помоги пользователю подобрать ресторан, забронировать столик и
-      оформить предварительный заказ, опираясь на его предпочтения.
+      оформить предварительный заказ, опираясь на его предпочтениям.
+
+  requirements_elicitation:
+    # collect_requirements: извлечение критериев в JSON (текст пользователю — шаблоны в коде).
+    api_key_env: "CLOUDRU_FOUNDATION_MODELS_API_KEY"
+    model: "zai-org/GLM-4.7"
+    max_tokens: 10000
+    temperature: 0.2
+    presence_penalty: 0.0
+    top_p: 0.95
+    system_prompt: >
+      Извлекай критерии в JSON и краткий user_reply (1–2 предложения). Не копируй дословно
+      реплику пользователя. В city — официальное полное название (Санкт-Петербург, Москва).
+
+  preorder_menu_pick:
+    # Автоподбор блюд из меню Toka по описанию пользователя (preorder_dialog).
+    api_key_env: "CLOUDRU_FOUNDATION_MODELS_API_KEY"
+    model: "zai-org/GLM-4.7"
+    max_tokens: 4096
+    temperature: 0.1
+    presence_penalty: 0.0
+    top_p: 0.95
+    system_prompt: >
+      Ты подбираешь блюда из меню ресторана. Ответ строго по схеме structured output:
+      объект с ключом items — массив {menu_item_id, quantity}, quantity от 1 до 10.
+      Используй только menu_item_id из каталога. Без markdown, без пояснений, только JSON.
 

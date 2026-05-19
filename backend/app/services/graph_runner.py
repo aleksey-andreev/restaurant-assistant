@@ -4,6 +4,7 @@ import asyncio
 import logging
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,7 +12,14 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from ..services.afisha_city_slug import resolve_afisha_city_slug
+from ..services.afisha_city_slug import list_supported_city_labels_ru, resolve_afisha_city_slug
+from ..services.location_reference import (
+    apply_canonical_location_to_req,
+    build_collect_requirements_location_hint,
+    location_reference_enabled,
+    run_elicitation_llm_with_location_tools,
+    validate_recommendation_requirements_fields_with_location,
+)
 from ..services.llm import LLMClientRegistry
 from ..storage.afisha_catalog_repository import (
     AfishaCatalogRepository,
@@ -24,8 +32,20 @@ from .search_plan_short_reply import classify_search_plan_short_reply
 logger = logging.getLogger(__name__)
 
 def fingerprint_search_plan(req: Dict[str, Any]) -> str:
-    """Stable fingerprint for search-relevant requirement fields (confirm / invalidate)."""
+    """
+    Stable fingerprint for search-relevant requirement fields (confirm / invalidate).
+    Branches on intent: 'named_restaurant' uses name/city/hint; 'search' uses city/loc/cuisine.
+    """
+    intent = (req.get("intent") or "search").strip().lower()
     city = (req.get("city") or "").strip().lower() if isinstance(req.get("city"), str) else ""
+
+    if intent == "named_restaurant":
+        name = (req.get("restaurant_name") or "").strip().lower()
+        hint = (req.get("address_or_hint") or "").strip().lower()
+        payload = {"intent": "named_restaurant", "city": city, "name": name, "hint": hint}
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+    # intent == "search"
     ps = req.get("party_size")
     party: Optional[int] = None
     if isinstance(ps, (int, float)) and not isinstance(ps, bool) and int(ps) >= 1:
@@ -53,6 +73,7 @@ def fingerprint_search_plan(req: Dict[str, Any]) -> str:
         if isinstance(x, str) and x.strip()
     )
     payload = {
+        "intent": "search",
         "city": city,
         "party": party,
         "budget": (mn, mx) if mn is not None and mx is not None else None,
@@ -64,11 +85,36 @@ def fingerprint_search_plan(req: Dict[str, Any]) -> str:
 
 
 def format_search_plan_summary(req: Dict[str, Any], *, include_confirmation_hint: bool = True) -> str:
-    """Human-readable plan for user confirmation (no occasion; cuisine default)."""
+    """
+    Human-readable plan for user confirmation.
+    Branches on intent: 'named_restaurant' shows name/city/hint; 'search' shows filters.
+    """
+    intent = (req.get("intent") or "search").strip().lower()
+
+    if intent == "named_restaurant":
+        name = str(req.get("restaurant_name") or "").strip() or "—"
+        city = str(req.get("city") or "").strip() or "—"
+        hint = str(req.get("address_or_hint") or "").strip()
+        lines = [
+            "Бронирование конкретного ресторана (проверьте и подтвердите):",
+            f"- Ресторан: {name}",
+            f"- Город: {city}",
+        ]
+        if hint:
+            lines.append(f"- Ориентир/адрес: {hint}")
+        if include_confirmation_hint:
+            lines.extend([
+                "",
+                "Если всё верно — нажмите «Подтвердить» или ответьте согласием в чате. "
+                "Чтобы изменить — напишите уточнение.",
+            ])
+        return "\n".join(lines)
+
+    # intent == "search"
     city = req.get("city") if isinstance(req.get("city"), str) else ""
     city = city.strip() or "—"
     ps = req.get("party_size")
-    party_s = f"{int(ps)}" if isinstance(ps, (int, float)) and not isinstance(ps, bool) and int(ps) >= 1 else "—"
+    party_s = f"{int(ps)}" if isinstance(ps, (int, float)) and not isinstance(ps, bool) and int(ps) >= 1 else "не указано"
 
     br = req.get("budget_range") or {}
     mn = mx = None
@@ -79,30 +125,30 @@ def format_search_plan_summary(req: Dict[str, Any], *, include_confirmation_hint
         except (TypeError, ValueError):
             pass
     if mn is not None and mx is not None:
-        budget_s = f"от {_fmt_money(mn)} до {_fmt_money(mx)} ₽ на человека"
+        budget_s = f"от {_fmt_money(mn)} до {_fmt_money(mx)} ₽"
     else:
-        budget_s = "—"
+        budget_s = "не указан"
 
     loc = req.get("location")
     if isinstance(loc, dict) and loc.get("type") in {"metro", "area"}:
         lv = loc.get("value")
         if isinstance(lv, str) and lv.strip():
-            loc_s = f"{_location_type_label_ru(loc.get('type'))}: {lv.strip()}"
+            loc_s = f"{_location_type_label_ru(loc.get('type'))} {lv.strip()}"
         else:
-            loc_s = "весь город (без привязки к метро/району)"
+            loc_s = "весь город"
     elif isinstance(loc, dict) and loc.get("type") == "none":
-        loc_s = "весь город (без привязки к метро/району)"
+        loc_s = "весь город"
     else:
-        loc_s = "—"
+        loc_s = "не указана"
 
     wanted = [str(x).strip() for x in (req.get("cuisine_wanted") or []) if isinstance(x, str) and str(x).strip()]
     avoided = [str(x).strip() for x in (req.get("cuisine_avoid") or []) if isinstance(x, str) and str(x).strip()]
     if wanted:
         cuisine_s = ", ".join(wanted[:6]) + ("…" if len(wanted) > 6 else "")
     elif avoided:
-        cuisine_s = f"без ограничений по типу; исключить: {', '.join(avoided[:4])}"
+        cuisine_s = f"без ограничений; исключить: {', '.join(avoided[:4])}"
     else:
-        cuisine_s = "без ограничений по кухне"
+        cuisine_s = "без ограничений"
 
     lines = [
         "Параметры поиска (проверьте и подтвердите):",
@@ -121,6 +167,477 @@ def format_search_plan_summary(req: Dict[str, Any], *, include_confirmation_hint
             ]
         )
     return "\n".join(lines)
+
+
+# Pipeline / ranking only — never expose in dialog context to the SPA.
+_CANDIDATE_INTERNAL_KEYS = frozenset({"toka_capacity_message", "toka_capacity_verified"})
+
+_CANDIDATE_LIST_CONTEXT_KEYS = (
+    "final_recommendations",
+    "recommendations",
+    "shortlist",
+)
+
+
+def strip_candidate_for_client(candidate: Any) -> Any:
+    if not isinstance(candidate, dict):
+        return candidate
+    return {k: v for k, v in candidate.items() if k not in _CANDIDATE_INTERNAL_KEYS}
+
+
+def sanitize_context_for_client(context: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove pipeline-only candidate fields before persisting or returning state to the UI."""
+    out = dict(context)
+    for key in _CANDIDATE_LIST_CONTEXT_KEYS:
+        val = out.get(key)
+        if isinstance(val, list):
+            out[key] = [strip_candidate_for_client(x) for x in val]
+    selected = out.get("booking_selected_candidate")
+    if isinstance(selected, dict):
+        out["booking_selected_candidate"] = strip_candidate_for_client(selected)
+    return out
+
+
+def _toka_capacity_trace_notes(candidates: List[Dict[str, Any]], *, limit: int = 50) -> List[Dict[str, Any]]:
+    notes: List[Dict[str, Any]] = []
+    for c in candidates:
+        msg = c.get("toka_capacity_message")
+        verified = c.get("toka_capacity_verified")
+        if not msg and verified is True:
+            continue
+        notes.append(
+            {
+                "url": c.get("url"),
+                "name": c.get("name"),
+                "verified": verified,
+                "message": msg,
+            }
+        )
+        if len(notes) >= limit:
+            break
+    return notes
+
+
+def attach_city_slug_from_reference(req: Dict[str, Any]) -> Dict[str, Any]:
+    """Set city_slug only via reference lookup on canonical city (no slang transliteration)."""
+    out = dict(req)
+    city = out.get("city")
+    if isinstance(city, str) and city.strip():
+        out["city_slug"] = resolve_afisha_city_slug(city.strip())
+    else:
+        out["city_slug"] = None
+    return out
+
+
+_ELICITATION_SLOT_LABELS: Dict[str, str] = {
+    "city": "город (официальное полное название на русском из списка поддерживаемых)",
+    "restaurant_name": "название ресторана",
+    "location_or_cuisine": "район, метро или тип кухни",
+}
+
+_COLLECT_LLM_RECOVERY_REPLY = (
+    "Не удалось сформировать ответ. Попробуйте переформулировать сообщение."
+)
+
+
+def _dialog_graph_invoke_timeout_s() -> float:
+    raw = os.environ.get("DIALOG_GRAPH_TIMEOUT_S", "120")
+    try:
+        return max(30.0, float(raw))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def validate_recommendation_requirements_fields(req: Dict[str, Any]) -> List[str]:
+    """
+    Детерминированная проверка полноты критериев поиска.
+
+    Ветка named_restaurant: имя + город (валидный city_slug).
+    Ветка search: город + (локация ИЛИ кухня).
+    """
+    missing: List[str] = []
+    intent = req.get("intent") or "search"
+
+    city = req.get("city")
+    city_ok = isinstance(city, str) and bool(city.strip())
+    slug = req.get("city_slug")
+    slug_ok = isinstance(slug, str) and bool(slug.strip())
+    if not city_ok or not slug_ok:
+        missing.append("city")
+
+    if intent == "named_restaurant":
+        name = req.get("restaurant_name")
+        if not (isinstance(name, str) and name.strip()):
+            missing.append("restaurant_name")
+    else:
+        loc = req.get("location")
+        has_location = isinstance(loc, dict) and loc.get("type") in {"metro", "area", "none"}
+        wanted = req.get("cuisine_wanted") or []
+        avoided = req.get("cuisine_avoid") or []
+        has_cuisine = bool(
+            (isinstance(wanted, list) and wanted) or (isinstance(avoided, list) and avoided)
+        )
+        if not has_location and not has_cuisine:
+            missing.append("location_or_cuisine")
+
+    return missing
+
+
+def compute_elicitation_validation_hints(
+    req: Dict[str, Any],
+    elicitation_prior: Optional[Dict[str, Any]] = None,
+    *,
+    districts: Optional[List[Dict[str, str]]] = None,
+    metro_names: Optional[List[str]] = None,
+) -> tuple[List[str], List[str], List[str]]:
+    """missing, unresolved (answered but not accepted), not_yet (not asked last turn)."""
+    req_checked = attach_city_slug_from_reference(dict(req))
+    slug = str(req_checked.get("city_slug") or "").strip().lower()
+    if location_reference_enabled(slug) and (districts is not None or metro_names is not None):
+        missing = validate_recommendation_requirements_fields_with_location(
+            req_checked,
+            districts=districts or [],
+            metro_names=metro_names or [],
+            base_validate=validate_recommendation_requirements_fields,
+        )
+    else:
+        missing = validate_recommendation_requirements_fields(req_checked)
+    prior_slots: set[str] = set()
+    if elicitation_prior:
+        prior_slots = {
+            str(x)
+            for x in (elicitation_prior.get("asked_slots") or [])
+            if isinstance(x, str) and str(x).strip()
+        }
+    unresolved = [s for s in missing if s in prior_slots]
+    not_yet = [s for s in missing if s not in prior_slots]
+    return missing, unresolved, not_yet
+
+
+def _format_elicitation_slot_labels(slots: List[str]) -> str:
+    return ", ".join(_ELICITATION_SLOT_LABELS.get(s, s) for s in slots) or "—"
+
+
+def build_elicitation_user_reply(
+    *,
+    missing: List[str],
+    unresolved: List[str],
+    not_yet: List[str],
+    req: Dict[str, Any],
+) -> str:
+    """Deterministic user-facing question when LLM user_reply is missing or echoed."""
+    intent = str(req.get("intent") or "search")
+    rname = str(req.get("restaurant_name") or "").strip()
+
+    if "city" in missing:
+        if "city" in unresolved:
+            return (
+                "Не удалось определить город по вашему ответу. "
+                "Укажите, пожалуйста, полное название города "
+                "(например Москва или Санкт-Петербург)."
+            )
+        if intent == "named_restaurant" and rname:
+            return f"Записал «{rname}». В каком городе этот ресторан?"
+        return "В каком городе искать ресторан?"
+
+    if "restaurant_name" in missing:
+        return "Как называется ресторан, который хотите забронировать?"
+
+    if "location_or_cuisine" in missing:
+        if "location_or_cuisine" in unresolved:
+            return (
+                "Не удалось понять район, метро или тип кухни. "
+                "Уточните, пожалуйста, где или какую кухню предпочитаете."
+            )
+        return (
+            "Уточните, пожалуйста, район или станцию метро, либо тип кухни — "
+            "так проще подобрать варианты."
+        )
+
+    return ""
+
+
+def build_elicitation_fallback_user_reply(
+    *,
+    missing: List[str],
+    unresolved: List[str],
+    not_yet: List[str],
+    req: Dict[str, Any],
+) -> str:
+    """Backward-compatible alias for build_elicitation_user_reply."""
+    return build_elicitation_user_reply(
+        missing=missing,
+        unresolved=unresolved,
+        not_yet=not_yet,
+        req=req,
+    )
+
+
+def pick_elicitation_user_reply(
+    *,
+    parsed: Dict[str, Any],
+    last_user_text: str,
+    req_complete: bool,
+    new_req: Dict[str, Any],
+    missing_fb: List[str],
+    unresolved_fb: List[str],
+    not_yet_fb: List[str],
+) -> tuple[str, str, List[str]]:
+    """
+    LLM wording when user_reply is valid and not an echo; else deterministic templates.
+    Returns (reply_text, reply_source, asked_slots).
+    """
+    llm_reply = str(parsed.get("user_reply") or "").strip()
+    llm_ok = bool(llm_reply) and not elicitation_reply_echoes_user_utterance(
+        llm_reply, last_user_text
+    )
+
+    if req_complete:
+        user_reply = build_elicitation_complete_user_reply(new_req)
+        reply_source = "template_complete"
+        if llm_ok:
+            return llm_reply, "llm_ack", []
+        return user_reply, reply_source, []
+
+    template_reply = build_elicitation_user_reply(
+        missing=missing_fb,
+        unresolved=unresolved_fb,
+        not_yet=not_yet_fb,
+        req=new_req,
+    )
+    asked_slots_new = [
+        s for s in missing_fb if s in unresolved_fb or s in not_yet_fb
+    ] or list(missing_fb)
+    llm_slots = [str(x) for x in (parsed.get("asked_slots") or []) if isinstance(x, str)]
+    if llm_slots:
+        asked_slots_new = llm_slots
+
+    if llm_ok:
+        return llm_reply, "llm_question", asked_slots_new
+    if template_reply:
+        return template_reply, "template_question", asked_slots_new
+    return _COLLECT_LLM_RECOVERY_REPLY, "recovery", asked_slots_new
+
+
+def build_elicitation_complete_user_reply(req: Dict[str, Any]) -> str:
+    """Acknowledgement when criteria are complete (before search pipeline)."""
+    intent = str(req.get("intent") or "search")
+    rname = str(req.get("restaurant_name") or "").strip()
+    city = str(req.get("city") or "").strip()
+    if intent == "named_restaurant" and rname and city:
+        return f"Записал «{rname}» в {city}. Начинаю поиск и проверку бронирования."
+    if intent == "named_restaurant" and rname:
+        return f"Записал «{rname}». Начинаю поиск."
+    if city:
+        return f"Понял, ищем в {city}. Подбираю варианты."
+    return "Критерии понятны — начинаю подбор ресторанов."
+
+
+def build_elicitation_validation_feedback_block(
+    *,
+    missing: List[str],
+    unresolved: List[str],
+    not_yet: List[str],
+    elicitation_prior: Dict[str, Any],
+    last_user_text: str,
+) -> str:
+    """Structured validation context for the elicitation LLM."""
+    lines = [
+        "Состояние проверки (служебно; не цитируй дословно последнюю реплику в user_reply):",
+        f"- Не хватает полей: {_format_elicitation_slot_labels(missing) if missing else 'ничего'}",
+    ]
+    if unresolved:
+        lines.append(
+            "- Пользователь уже отвечал на твой вопрос про: "
+            f"{_format_elicitation_slot_labels(unresolved)}, "
+            "но в черновике критериев это ещё не принято "
+            "(нет значения или город не из поддерживаемых каталога)."
+        )
+    if not_yet:
+        lines.append(
+            "- Про эти поля ты ещё не спрашивал в прошлом ответе ассистента: "
+            f"{_format_elicitation_slot_labels(not_yet)}."
+        )
+    prior_text = str(elicitation_prior.get("text") or "").strip()
+    prior_slots = list(elicitation_prior.get("asked_slots") or [])
+    if prior_text and prior_slots:
+        lines.append(f"- В прошлом ответе ассистента спрашивали: {prior_slots}")
+    if last_user_text.strip() and unresolved:
+        lines.append(
+            "- Последняя реплика пользователя могла относиться к непринятым полям; "
+            "извлеки из неё значения для этих слотов (см. историю диалога)."
+        )
+    return "\n".join(lines) + "\n\n"
+
+
+_RE_ELICITATION_STRIP_FENCE = re.compile(r"```(?:json)?\s*|\s*```", re.IGNORECASE)
+
+
+def elicitation_reply_echoes_user_utterance(user_reply: str, last_user_message: str) -> bool:
+    """True if the model put the user's own text into user_reply (GigaChat / broken JSON)."""
+    a = re.sub(r"\s+", " ", (user_reply or "").strip())
+    b = re.sub(r"\s+", " ", (last_user_message or "").strip())
+    return bool(a) and bool(b) and a.casefold() == b.casefold()
+
+
+_RE_ELICITATION_THINK_BLOCK = re.compile(
+    r"<\s*think\s*>[\s\S]*?<\s*/\s*think\s*>",
+    re.IGNORECASE,
+)
+_RE_ELICITATION_REDACTED_BLOCK = re.compile(
+    r"<\s*redacted_thinking\s*>[\s\S]*?<\s*/\s*redacted_thinking\s*>",
+    re.IGNORECASE,
+)
+_RE_ELICITATION_REDACTED_CLOSE = re.compile(r"<\s*/\s*redacted_thinking\s*>", re.IGNORECASE)
+
+
+def _strip_elicitation_llm_wrapper(raw: Optional[str]) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    text = _RE_ELICITATION_THINK_BLOCK.sub("", text).strip()
+    text = _RE_ELICITATION_REDACTED_BLOCK.sub("", text).strip()
+    close = _RE_ELICITATION_REDACTED_CLOSE.search(text)
+    if close:
+        text = text[close.end() :].strip()
+    text = _RE_ELICITATION_STRIP_FENCE.sub("", text).strip()
+    return text
+
+
+def parse_elicitation_llm_json(raw: Optional[str]) -> Dict[str, Any]:
+    js = _strip_elicitation_llm_wrapper(raw)
+    if not js:
+        return {}
+    st = js.find("{")
+    en = js.rfind("}")
+    if st >= 0 and en > st:
+        try:
+            parsed = json.loads(js[st : en + 1])
+            if isinstance(parsed, dict):
+                return normalize_elicitation_parsed(parsed)
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def normalize_elicitation_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept common alias keys from reasoning models without changing the public schema."""
+    out = dict(parsed)
+    if not str(out.get("user_reply") or "").strip():
+        for key in ("user_reply", "reply", "message", "assistant_reply", "response"):
+            v = out.get(key)
+            if isinstance(v, str) and v.strip():
+                out["user_reply"] = v.strip()
+                break
+    return out
+
+
+def merge_elicitation_llm_dicts(
+    primary: Dict[str, Any], secondary: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Merge two LLM parses; secondary fills gaps, does not wipe non-null primary fields."""
+    a = normalize_elicitation_parsed(dict(primary or {}))
+    b = normalize_elicitation_parsed(dict(secondary or {}))
+    out = dict(a)
+    for key, val in b.items():
+        if val is None:
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        if isinstance(val, list) and not val:
+            continue
+        if key not in out or out.get(key) in (None, "", []):
+            out[key] = val
+    return out
+
+
+def elicitation_parsed_for_trace(
+    parsed: Dict[str, Any], *, last_user_text: str = ""
+) -> Dict[str, Any]:
+    """Sanitized LLM JSON for pipeline_events (what the model returned)."""
+    p = normalize_elicitation_parsed(dict(parsed or {}))
+    keys = (
+        "intent",
+        "restaurant_name",
+        "city",
+        "city_slug",
+        "location",
+        "party_size",
+        "asked_slots",
+        "cuisine_wanted",
+        "cuisine_avoid",
+        "user_reply",
+    )
+    out: Dict[str, Any] = {k: p.get(k) for k in keys if k in p and p.get(k) not in (None, "", [])}
+    ur = str(p.get("user_reply") or "").strip()
+    if ur:
+        out["user_reply_len"] = len(ur)
+        if last_user_text.strip():
+            out["user_reply_echo"] = elicitation_reply_echoes_user_utterance(ur, last_user_text)
+    return out
+
+
+def merge_elicitation_llm_parse(prev_req: Dict[str, Any], parsed: Dict[str, Any]) -> Dict[str, Any]:
+    parsed = normalize_elicitation_parsed(dict(parsed or {}))
+    new_req = dict(prev_req)
+    for field in (
+        "intent",
+        "restaurant_name",
+        "address_or_hint",
+        "source_url",
+        "location",
+        "party_size",
+        "budget_range",
+        "occasion",
+    ):
+        v = parsed.get(field)
+        if v is not None:
+            new_req[field] = v
+    for list_field in ("cuisine_wanted", "cuisine_avoid", "must_have"):
+        v = parsed.get(list_field)
+        if isinstance(v, list) and v:
+            new_req[list_field] = v
+    city_raw = parsed.get("city")
+    if isinstance(city_raw, str) and city_raw.strip():
+        new_req["city"] = city_raw.strip()
+    return attach_city_slug_from_reference(new_req)
+
+
+def resolver_req_for_named_restaurant(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Input for resolve_specific_restaurant_candidates.
+
+    Alpha flow stores criteria in recommendation_requirements (restaurant_name, city, …);
+    legacy flow used specific_restaurant_requirements (name, city_slug, …).
+    """
+    legacy = dict(state.get("specific_restaurant_requirements") or {})
+    if isinstance(legacy.get("name"), str) and legacy.get("name").strip():
+        if isinstance(legacy.get("city_slug"), str) and legacy.get("city_slug").strip():
+            return legacy
+
+    rec = dict(state.get("recommendation_requirements") or {})
+    if (rec.get("intent") or "search") != "named_restaurant":
+        if legacy:
+            return legacy
+        return {}
+
+    name = str(rec.get("restaurant_name") or rec.get("name") or "").strip()
+    city = str(rec.get("city") or "").strip()
+    city_slug = str(rec.get("city_slug") or "").strip()
+    if not city_slug and city:
+        city_slug = resolve_afisha_city_slug(city) or ""
+    hint = str(rec.get("address_or_hint") or "").strip()
+    url = str(rec.get("source_url") or "").strip()
+    if not name:
+        return {}
+    out: Dict[str, Any] = {
+        "name": name,
+        "city": city or None,
+        "city_slug": city_slug,
+        "address_or_hint": hint or None,
+        "source_url": url or None,
+    }
+    return out
 
 
 def _fmt_money(v: float) -> str:
@@ -211,12 +728,20 @@ class RecState(TypedDict, total=False):
     requirements_prompt_count: int
     # analytics: append-only events persisted in graph_state.context
     pipeline_trace: List[Dict[str, Any]]
-    # intent: direct booking of a specific restaurant
+    # intent: direct booking of a specific restaurant (legacy; kept for booking pipeline)
     booking_intent_mode: Optional[str]
     specific_restaurant_requirements: Dict[str, Any]
     specific_restaurant_missing_fields: List[str]
     specific_restaurant_resolved: bool
     client_time_zone: Optional[str]
+    # elicitation phase (alpha): conversational requirements collection
+    last_elicitation: Dict[str, Any]   # {text: str, asked_slots: List[str]}
+    elicitation_prior_turn: Dict[str, Any]  # last_elicitation snapshot at start of collect (for validate)
+    elicitation_turn: int
+    # validation context for next collect turn (persisted across HTTP requests)
+    missing_globally: List[str]
+    unresolved_from_last_question: List[str]
+    not_yet_prompted: List[str]
     # preorder after successful reservation (Toka); must stay in RecState so LangGraph persists keys
     preorder_phase: Optional[str]
     preorder_menu_available: bool
@@ -329,6 +854,18 @@ class GraphRunner:
                 )
                 if preorder_out is not None:
                     return preorder_out
+            if ph == "done" and ctx.get("save_receipt_offered") and not ctx.get("save_receipt_done"):
+                from .receipt_save_dialog import try_handle_receipt_save
+
+                save_out = await try_handle_receipt_save(
+                    session_id=session_id,
+                    messages=messages,
+                    client_action=client_action,
+                    ctx=ctx,
+                    state_repository=self.state_repository,
+                )
+                if save_out is not None:
+                    return save_out
 
         form_booking_payload: Optional[Dict[str, Any]] = None
         if client_action and client_action.get("type") == "submit_booking":
@@ -558,7 +1095,8 @@ class GraphRunner:
                 "- missing_fields: массив строк (вспомогательно)\n"
                 "- recommendation_requirements:\n"
                 "  city: string|null\n"
-                "  city_slug: всегда null — префикс города для afisha.ru вычисляет система из city, не заполняй.\n"
+                "  city_slug: всегда null — система подставит slug только по каноническому полному названию city.\n"
+                "  city: официальное название (Санкт-Петербург, не Питер; Владивосток, не Владик).\n"
                 "  location: {type: 'metro'|'area'|'none', value: string|null}|null\n"
                 "  budget_range: {min: number, max: number}|null\n"
                 "  party_size: number|null\n"
@@ -1062,7 +1600,7 @@ class GraphRunner:
         async def resolve_specific_restaurant_node(state: RecState) -> RecState:
             from .toka_specific_restaurant_resolver import resolve_specific_restaurant_candidates
 
-            req = dict(state.get("specific_restaurant_requirements") or {})
+            req = resolver_req_for_named_restaurant(state)
             name = str(req.get("name") or "").strip()
             city_slug = str(req.get("city_slug") or "").strip()
             hint = str(req.get("address_or_hint") or "").strip()
@@ -1071,10 +1609,19 @@ class GraphRunner:
                     **state,
                     "current_node": "resolve_specific_restaurant",
                     "specific_restaurant_resolved": False,
+                    "specific_restaurant_requirements": req,
+                    "reply": (
+                        "Не удалось определить ресторан для брони: нужны название и город. "
+                        "Напишите, пожалуйста, название ресторана и город одним сообщением."
+                    ),
                     "pipeline_trace": _trace_append(
                         state,
                         "resolve_specific_restaurant",
-                        {"status": "invalid_requirements"},
+                        {
+                            "status": "invalid_requirements",
+                            "name": name or None,
+                            "city_slug": city_slug or None,
+                        },
                     ),
                 }
 
@@ -1362,26 +1909,27 @@ class GraphRunner:
                 return re.sub(r"\s+", " ", v.strip().lower())
 
             async def _normalize_area_from_user(req_loc: Dict[str, Any], city_slug: str) -> Optional[str]:
+                from .location_reference import search_districts
+
                 raw = req_loc.get("value")
                 if not isinstance(raw, str) or not raw.strip():
                     return None
-                raw_norm = _norm_token(raw).replace(" р-н", " район")
                 rows = []
                 if catalog_repo is not None and city_slug:
                     rows = await asyncio.to_thread(catalog_repo.list_city_districts, city_slug)
+                if rows:
+                    hits = search_districts(rows, raw.strip(), limit=3)
+                    if len(hits) == 1 and hits[0]["score"] >= 0.78:
+                        return hits[0]["district_label"]
+                    if hits and hits[0]["score"] >= 0.92:
+                        return hits[0]["district_label"]
+                if not rows:
+                    return None
                 norm_to_label: Dict[str, str] = {}
                 for r in rows:
                     n = _norm_token(r.get("district_norm"))
                     if n:
                         norm_to_label[n] = str(r.get("district_label") or "").strip()
-                if raw_norm in norm_to_label:
-                    return norm_to_label[raw_norm]
-                if raw_norm and not raw_norm.endswith("район"):
-                    raw_try = f"{raw_norm} район"
-                    if raw_try in norm_to_label:
-                        return norm_to_label[raw_try]
-                if not norm_to_label:
-                    return None
                 options = sorted(norm_to_label.keys())
                 prompt = (
                     "Нормализуй пользовательский район к одному из допустимых значений.\n"
@@ -1626,16 +2174,43 @@ class GraphRunner:
 
             req = state.get("recommendation_requirements") or {}
             ps = req.get("party_size")
-            try:
-                party_n = int(ps) if ps is not None and not isinstance(ps, bool) else 1
-            except Exception:
-                party_n = 1
-            party_n = max(1, party_n)
 
             candidates = list(state.get("candidates") or [])
+
+            # Если party_size не задан — пропускаем Toka, все кандидаты проходят.
+            # Помечаем как verified=True, чтобы apply_toka_unverified_score_penalty
+            # не занижал формальный скор.
+            party_n: Optional[int] = None
+            try:
+                if ps is not None and not isinstance(ps, bool):
+                    v = int(ps)
+                    if v >= 1:
+                        party_n = v
+            except Exception:
+                pass
+
+            if party_n is None:
+                gated = [{**c, "toka_capacity_verified": True, "toka_capacity_message": None} for c in candidates]
+                return {
+                    **state,
+                    "current_node": "toka_capacity_gate",
+                    "candidates": gated,
+                    "pipeline_trace": _trace_append(
+                        state,
+                        "toka_capacity_gate",
+                        {
+                            "in_count": len(candidates),
+                            "out_count": len(gated),
+                            "skipped": True,
+                            "reason": "party_size not set — gate skipped",
+                        },
+                    ),
+                }
+
             gated, extra_err = await apply_toka_capacity_gate(candidates, party_n)
             errors = list(state.get("service_errors") or [])
             errors.extend(extra_err)
+            cap_notes = _toka_capacity_trace_notes(gated)
 
             return {
                 **state,
@@ -1649,6 +2224,7 @@ class GraphRunner:
                         "in_count": len(candidates),
                         "out_count": len(gated),
                         "party_size": party_n,
+                        **({"capacity_notes": cap_notes} if cap_notes else {}),
                     },
                 ),
             }
@@ -2167,15 +2743,438 @@ class GraphRunner:
                 )
                 return state
 
-        # Build graph
+        # ── Alpha: новые узлы сбора и валидации требований ────────────────
+
+        req_llm_client, _req_sys, req_node_params = self.llm_registry.get_node_or_default(
+            "requirements_elicitation"
+        )
+
+        async def collect_requirements_node(state: RecState) -> RecState:
+            """
+            Один диалоговый ход: LLM-вызов для выявления критериев поиска.
+            Обрабатывает confirm_search_plan action и короткие ответы «да/нет»
+            без LLM. Возвращает обновлённый черновик требований + текст пользователю.
+            """
+            # Ранний выход для form_booking_payload — collect пропускаем
+            if form_booking_payload is not None:
+                return {
+                    **state,
+                    "current_node": "collect_requirements",
+                    "elicitation_prior_turn": dict(state.get("last_elicitation") or {}),
+                    "pipeline_trace": _trace_append(
+                        state, "collect_requirements", {"skipped": True, "reason": "submit_booking"}
+                    ),
+                }
+
+            prev_req: Dict[str, Any] = dict(state.get("recommendation_requirements") or {})
+            elicitation_prior_turn: Dict[str, Any] = dict(state.get("last_elicitation") or {})
+
+            # Обработка confirm_search_plan action (кнопка «Подтвердить»)
+            if client_action and client_action.get("type") == "confirm_search_plan":
+                prev_req = attach_city_slug_from_reference(prev_req)
+                miss = validate_recommendation_requirements_fields(prev_req)
+                if not miss:
+                    fp = fingerprint_search_plan(prev_req)
+                    spec_sync = resolver_req_for_named_restaurant(
+                        {**state, "recommendation_requirements": prev_req}
+                    )
+                    return {
+                        **state,
+                        "current_node": "collect_requirements",
+                        "elicitation_prior_turn": elicitation_prior_turn,
+                        "recommendation_requirements": prev_req,
+                        "specific_restaurant_requirements": spec_sync
+                        if spec_sync
+                        else dict(state.get("specific_restaurant_requirements") or {}),
+                        "search_plan_confirmed": True,
+                        "search_plan_fingerprint": fp,
+                        "search_plan_revision_requested": False,
+                        "missing_globally": [],
+                        "pipeline_trace": _trace_append(
+                            state, "collect_requirements",
+                            {"skipped_llm": True, "reason": "confirm_search_plan", "fingerprint": fp}
+                        ),
+                    }
+                # Если поля неполные — продолжаем сбор
+                return {
+                    **state,
+                    "current_node": "collect_requirements",
+                    "elicitation_prior_turn": elicitation_prior_turn,
+                    "missing_globally": miss,
+                    "search_plan_confirmed": False,
+                    "pipeline_trace": _trace_append(
+                        state, "collect_requirements",
+                        {"confirm_rejected": True, "missing": miss}
+                    ),
+                }
+
+            # Обработка коротких ответов «да/нет» на confirm
+            if not client_action and not bool(state.get("search_plan_confirmed")):
+                prev_req_slug = attach_city_slug_from_reference(prev_req)
+                miss_check = validate_recommendation_requirements_fields(prev_req_slug)
+                if not miss_check:
+                    short = classify_search_plan_short_reply(_last_user_text())
+                    if short == "affirm":
+                        fp_a = fingerprint_search_plan(prev_req_slug)
+                        return {
+                            **state,
+                            "current_node": "collect_requirements",
+                            "elicitation_prior_turn": elicitation_prior_turn,
+                            "recommendation_requirements": prev_req_slug,
+                            "search_plan_confirmed": True,
+                            "search_plan_fingerprint": fp_a,
+                            "search_plan_revision_requested": False,
+                            "missing_globally": [],
+                            "pipeline_trace": _trace_append(
+                                state, "collect_requirements",
+                                {"skipped_llm": True, "reason": "short_reply_affirm"}
+                            ),
+                        }
+                    if short == "reject":
+                        return {
+                            **state,
+                            "current_node": "collect_requirements",
+                            "elicitation_prior_turn": elicitation_prior_turn,
+                            "search_plan_confirmed": False,
+                            "search_plan_revision_requested": True,
+                            "missing_globally": [],
+                            "reply": (
+                                "Хорошо, что хотите изменить? Напишите уточнение — "
+                                "город, гостей, бюджет, район или кухню."
+                            ),
+                            "pipeline_trace": _trace_append(
+                                state, "collect_requirements",
+                                {"skipped_llm": True, "reason": "short_reply_reject"}
+                            ),
+                        }
+
+            # Сброс флага revision (уже обработан в следующем ходе)
+            if bool(state.get("search_plan_revision_requested")):
+                prev_req.pop("city_slug", None)  # пересчитаем после изменений
+
+            turn = int(state.get("elicitation_turn") or 0)
+            last_user_text = _last_user_text()
+            prev_req_for_ref = attach_city_slug_from_reference(dict(prev_req))
+            ref_city_slug = str(prev_req_for_ref.get("city_slug") or "").strip().lower()
+            ref_districts: List[Dict[str, str]] = []
+            ref_metros: List[str] = []
+            if location_reference_enabled(ref_city_slug) and catalog_repo is not None:
+                ref_districts = await asyncio.to_thread(
+                    catalog_repo.list_city_districts, ref_city_slug
+                )
+                ref_metros = await asyncio.to_thread(
+                    catalog_repo.list_distinct_metro_names, ref_city_slug
+                )
+
+            missing_globally, unresolved, not_yet = compute_elicitation_validation_hints(
+                prev_req,
+                elicitation_prior_turn,
+                districts=ref_districts if ref_districts else None,
+                metro_names=ref_metros if ref_metros else None,
+            )
+
+            supported_cities = ", ".join(list_supported_city_labels_ru())
+            validation_feedback = build_elicitation_validation_feedback_block(
+                missing=missing_globally,
+                unresolved=unresolved,
+                not_yet=not_yet,
+                elicitation_prior=elicitation_prior_turn,
+                last_user_text=last_user_text,
+            )
+
+            prompt_sys = (
+                "Ты извлекаешь критерии подбора/бронирования ресторана из диалога и "
+                "кратко отвечаешь пользователю (1–2 предложения).\n\n"
+                "Не выводи chain-of-thought и пояснения вне JSON. Ответ — один JSON-объект.\n\n"
+                "Схема:\n"
+                "{\n"
+                '  "intent": "search" | "named_restaurant",\n'
+                '  "restaurant_name": string | null,\n'
+                '  "city": string | null,\n'
+                '  "city_slug": null,\n'
+                '  "address_or_hint": string | null,\n'
+                '  "source_url": string | null,\n'
+                '  "location": {"type": "metro"|"area"|"none", "value": string|null} | null,\n'
+                '  "party_size": number | null,\n'
+                '  "budget_range": {"min": number, "max": number} | null,\n'
+                '  "cuisine_wanted": [string],\n'
+                '  "cuisine_avoid": [string],\n'
+                '  "must_have": [string],\n'
+                '  "occasion": string | null,\n'
+                '  "user_reply": string,\n'
+                '  "asked_slots": [string]\n'
+                "}\n\n"
+                "Правила:\n"
+                "- Не домысливай party_size, бюджет, кухню, район — только если пользователь сказал.\n"
+                "- city — официальное полное название на русском; жаргон нормализуй "
+                "(Питер → Санкт-Петербург, Мск → Москва).\n"
+                "- city_slug всегда null (slug подставит система).\n"
+                f"- Поддерживаемые города: {supported_cities}. "
+                "Если город не из списка — city null.\n"
+                "- intent='named_restaurant' если назван конкретный ресторан.\n"
+                "- user_reply — твой ответ ассистентом; не копируй дословно последнее сообщение "
+                "пользователя. Если критериев не хватает — вежливо уточни недостающее.\n"
+                "- asked_slots — поля, о которых спрашиваешь в user_reply: "
+                "['city', 'restaurant_name', 'location_or_cuisine']; иначе [].\n\n"
+                "Пример. «Забронируй ресторан Ипполит» →\n"
+                '{"intent":"named_restaurant","restaurant_name":"Ипполит","city":null,'
+                '"city_slug":null,"user_reply":"Понял, Ипполит. В каком городе он?",'
+                '"asked_slots":["city"]}\n\n'
+                "Пример. «Итальянская кухня в центре Питера на 4 человек» →\n"
+                '{"intent":"search","city":"Санкт-Петербург","location":{"type":"area",'
+                '"value":"центр"},"party_size":4,"cuisine_wanted":["итальянская"],'
+                '"user_reply":"Ищу итальянские рестораны в центре Петербурга на четверых.",'
+                '"asked_slots":[]}'
+            )
+            prompt_sys += build_collect_requirements_location_hint(ref_city_slug)
+
+            user_msgs: List[Dict[str, Any]] = [
+                m for m in messages if m.get("role") in {"user", "assistant"} and m.get("content")
+            ]
+            history_text = "\n".join(
+                f"{'Пользователь' if m['role'] == 'user' else 'Ассистент'}: {m['content']}"
+                for m in user_msgs[-10:]
+            )
+
+            prompt_user = (
+                f"Ход диалога: {turn + 1}.\n\n"
+                f"{validation_feedback}"
+                f"История диалога:\n{history_text}\n\n"
+                f"Ранее извлечённые критерии (сохраняй, не теряй):\n"
+                f"{json.dumps(prev_req, ensure_ascii=False)}\n\n"
+                "Обнови критерии и user_reply в JSON по истории и блоку проверки."
+            )
+
+            llm_kwargs = {**req_node_params, "response_format": {"type": "json_object"}}
+            location_tool_trace: List[Dict[str, Any]] = []
+
+            async def _elicitation_chat(user_content: str) -> tuple[Dict[str, Any], bool, bool]:
+                try:
+                    if location_reference_enabled(ref_city_slug) and ref_districts:
+                        parsed_out, location_tool_trace[:] = (
+                            await run_elicitation_llm_with_location_tools(
+                                req_llm_client,
+                                system_prompt=prompt_sys,
+                                user_prompt=user_content,
+                                node_params=req_node_params,
+                                city_slug=ref_city_slug,
+                                districts=ref_districts,
+                                metro_names=ref_metros,
+                                parse_json=parse_elicitation_llm_json,
+                            )
+                        )
+                        return parsed_out, bool(parsed_out), False
+                    raw = await req_llm_client.chat(
+                        messages=[
+                            {"role": "system", "content": prompt_sys},
+                            {"role": "user", "content": user_content},
+                        ],
+                        **llm_kwargs,
+                    )
+                    parsed_out = parse_elicitation_llm_json(raw)
+                    return parsed_out, bool(parsed_out), False
+                except Exception as exc:
+                    if "timeout" in type(exc).__name__.lower():
+                        logger.warning(
+                            "collect_requirements LLM timed out (provider HTTP timeout): %s",
+                            exc,
+                        )
+                        return {}, False, True
+                    logger.exception("collect_requirements LLM call failed")
+                    return {}, False, False
+
+            parsed_first, parse_ok_first, llm_timed_out = await _elicitation_chat(prompt_user)
+            parsed = dict(parsed_first)
+            llm_retried = False
+
+            def _req_complete(req: Dict[str, Any]) -> bool:
+                r = attach_city_slug_from_reference(dict(req))
+                if location_reference_enabled(str(r.get("city_slug") or "")):
+                    miss = validate_recommendation_requirements_fields_with_location(
+                        r,
+                        districts=ref_districts,
+                        metro_names=ref_metros,
+                        base_validate=validate_recommendation_requirements_fields,
+                    )
+                else:
+                    miss = validate_recommendation_requirements_fields(r)
+                return len(miss) == 0
+
+            if (not llm_timed_out) and not parse_ok_first:
+                llm_retried = True
+                retry_content = (
+                    f"{prompt_user}\n\n"
+                    "Предыдущий ответ не содержал валидного JSON. "
+                    "Верни снова один JSON-объект по схеме в system (критерии + user_reply)."
+                )
+                parsed_retry, parse_ok_retry, _ = await _elicitation_chat(retry_content)
+                if parse_ok_retry or parsed_retry:
+                    parsed = merge_elicitation_llm_dicts(parsed_first, parsed_retry)
+
+            new_req = attach_city_slug_from_reference(merge_elicitation_llm_parse(prev_req, parsed))
+            loc_meta: Dict[str, Any] = {}
+            slug_after = str(new_req.get("city_slug") or "").strip().lower()
+            if location_reference_enabled(slug_after) and catalog_repo is not None:
+                if slug_after != ref_city_slug or not ref_districts:
+                    ref_districts = await asyncio.to_thread(
+                        catalog_repo.list_city_districts, slug_after
+                    )
+                    ref_metros = await asyncio.to_thread(
+                        catalog_repo.list_distinct_metro_names, slug_after
+                    )
+                if ref_districts:
+                    new_req, loc_meta = apply_canonical_location_to_req(
+                        new_req,
+                        districts=ref_districts,
+                        metro_names=ref_metros,
+                    )
+            req_complete = _req_complete(new_req)
+
+            missing_fb, unresolved_fb, not_yet_fb = compute_elicitation_validation_hints(
+                new_req,
+                elicitation_prior_turn,
+                districts=ref_districts if ref_districts else None,
+                metro_names=ref_metros if ref_metros else None,
+            )
+
+            user_reply, reply_source, asked_slots_new = pick_elicitation_user_reply(
+                parsed=parsed,
+                last_user_text=last_user_text,
+                req_complete=req_complete,
+                new_req=new_req,
+                missing_fb=missing_fb,
+                unresolved_fb=unresolved_fb,
+                not_yet_fb=not_yet_fb,
+            )
+
+            spec_sync = resolver_req_for_named_restaurant(
+                {**state, "recommendation_requirements": new_req}
+            )
+
+            return {
+                **state,
+                "current_node": "collect_requirements",
+                "elicitation_prior_turn": elicitation_prior_turn,
+                "recommendation_requirements": new_req,
+                "specific_restaurant_requirements": spec_sync
+                if spec_sync
+                else state.get("specific_restaurant_requirements") or {},
+                "reply": user_reply,
+                "last_elicitation": {"text": user_reply, "asked_slots": asked_slots_new},
+                "elicitation_turn": turn + 1,
+                "missing_globally": [],
+                "unresolved_from_last_question": [],
+                "not_yet_prompted": [],
+                "pipeline_trace": _trace_append(
+                    state,
+                    "collect_requirements",
+                    {
+                        "turn": turn + 1,
+                        "asked_slots": asked_slots_new,
+                        "intent": new_req.get("intent"),
+                        "validation_hints": {
+                            "missing": missing_globally,
+                            "unresolved": unresolved,
+                            "not_yet": not_yet,
+                        },
+                        "llm_retry": llm_retried,
+                        "reply_source": reply_source,
+                        "llm_parse_ok": bool(parsed),
+                        "llm_parsed": elicitation_parsed_for_trace(
+                            parsed, last_user_text=last_user_text
+                        ),
+                        "missing_after_merge": missing_fb,
+                        "city_after_merge": new_req.get("city"),
+                        "city_slug_after_merge": new_req.get("city_slug"),
+                        "location_after_merge": new_req.get("location"),
+                        "location_meta": loc_meta,
+                        "location_tools": location_tool_trace,
+                        "requirements_complete": req_complete,
+                    },
+                ),
+            }
+
+        async def validate_requirements_node(state: RecState) -> RecState:
+            """
+            Детерминированная проверка полноты требований без LLM.
+            Вычисляет missing_globally, unresolved, not_yet для следующего хода collect.
+            """
+            req = attach_city_slug_from_reference(
+                dict(state.get("recommendation_requirements") or {})
+            )
+            prior_elic = dict(state.get("elicitation_prior_turn") or {})
+            prior_slots = list(prior_elic.get("asked_slots") or [])
+
+            ref_slug = str(req.get("city_slug") or "").strip().lower()
+            v_districts: List[Dict[str, str]] = []
+            v_metros: List[str] = []
+            if location_reference_enabled(ref_slug) and catalog_repo is not None:
+                v_districts = await asyncio.to_thread(catalog_repo.list_city_districts, ref_slug)
+                v_metros = await asyncio.to_thread(
+                    catalog_repo.list_distinct_metro_names, ref_slug
+                )
+            if location_reference_enabled(ref_slug) and v_districts:
+                missing = validate_recommendation_requirements_fields_with_location(
+                    req,
+                    districts=v_districts,
+                    metro_names=v_metros,
+                    base_validate=validate_recommendation_requirements_fields,
+                )
+            else:
+                missing = validate_recommendation_requirements_fields(req)
+            unresolved = [s for s in missing if s in set(prior_slots)]
+            not_yet = [s for s in missing if s not in set(prior_slots)]
+
+            return {
+                **state,
+                "current_node": "validate_requirements",
+                "missing_globally": missing,
+                "unresolved_from_last_question": unresolved,
+                "not_yet_prompted": not_yet,
+                "requirements_complete": len(missing) == 0,
+                "pipeline_trace": _trace_append(
+                    state,
+                    "validate_requirements",
+                    {
+                        "missing": missing,
+                        "unresolved": unresolved,
+                        "not_yet": not_yet,
+                        "intent": req.get("intent"),
+                    },
+                ),
+            }
+
+        async def elicitation_await_user_node(state: RecState) -> RecState:
+            """
+            Требования ещё неполные: ответ уже в state['reply'] от collect.
+            Завершаем HTTP-ход (END); следующее сообщение пользователя снова войдёт в collect.
+            """
+            reply = str(state.get("reply") or "").strip()
+            if not reply:
+                reply = _COLLECT_LLM_RECOVERY_REPLY
+            return {
+                **state,
+                "current_node": "elicitation_await_user",
+                "reply": reply,
+                "pipeline_trace": _trace_append(
+                    state,
+                    "elicitation_await_user",
+                    {"missing": state.get("missing_globally") or []},
+                ),
+            }
+
+        # ── Build graph ─────────────────────────────────────────────────────
+
         graph = StateGraph(RecState)
-        graph.add_node("extract_requirements", extract_requirements_node)
-        graph.add_node("detect_booking_intent", detect_booking_intent_node)
-        graph.add_node("ask_questions", ask_questions_node)
+
+        # Новые узлы фазы сбора требований
+        graph.add_node("collect_requirements", collect_requirements_node)
+        graph.add_node("validate_requirements", validate_requirements_node)
+        graph.add_node("elicitation_await_user", elicitation_await_user_node)
+
+        # Сохранённые узлы (бронирование, пайплайн подбора, confirm)
         graph.add_node("confirm_search_plan", confirm_search_plan_node)
         graph.add_node("ask_search_plan_revision", ask_search_plan_revision_node)
-        graph.add_node("extract_specific_restaurant", extract_specific_restaurant_requirements_node)
-        graph.add_node("ask_specific_restaurant_questions", ask_specific_restaurant_questions_node)
         graph.add_node("resolve_specific_restaurant", resolve_specific_restaurant_node)
         graph.add_node("load_afisha_candidate_urls", load_afisha_candidate_urls_node)
         graph.add_node("fetch_afisha_cards", fetch_afisha_cards_node)
@@ -2193,52 +3192,55 @@ class GraphRunner:
         graph.add_node("ask_booking_questions", ask_booking_questions_node)
         graph.add_node("create_reservation", create_reservation_node)
 
-        graph.set_entry_point("extract_requirements")
+        # ── Entry point и ранняя маршрутизация ──────────────────────────────
+        graph.set_entry_point("collect_requirements")
 
-        def route_after_extract(s: RecState) -> str:
-            # submit_booking must always enter the booking pipeline (do not depend on
-            # booking_pending alone — after a successful reservation it is false).
+        def route_after_collect(s: RecState) -> str:
+            return "validate_requirements"
+
+        def route_after_validate(s: RecState) -> str:
+            # Ранние выходы для бронирования (выше любой логики требований)
             if form_booking_payload is not None:
                 return "extract_booking_requirements"
             if s.get("booking_pending"):
                 return "extract_booking_requirements"
-            if s.get("booking_intent_mode") == "specific_restaurant":
-                return "extract_specific_restaurant"
+            # Пользователь запросил правку плана
             if s.get("search_plan_revision_requested"):
                 return "ask_search_plan_revision"
-            if not s.get("requirements_complete"):
-                return "ask_questions"
-            if not bool(s.get("search_plan_confirmed")):
-                return "confirm_search_plan"
-            return "load_afisha_candidate_urls"
+            # Неполные требования: один LLM-ход на HTTP-запрос, затем END (ответ в reply).
+            if s.get("missing_globally"):
+                return "elicitation_await_user"
+            # Требования полные: план подтверждён — идём в поиск
+            req = s.get("recommendation_requirements") or {}
+            if bool(s.get("search_plan_confirmed")):
+                intent = req.get("intent") or "search"
+                if intent == "named_restaurant":
+                    return "resolve_specific_restaurant"
+                return "load_afisha_candidate_urls"
+            # Требования полные, план ещё не подтверждён — показываем confirm
+            return "confirm_search_plan"
 
-        graph.add_edge("extract_requirements", "detect_booking_intent")
         graph.add_conditional_edges(
-            "detect_booking_intent",
-            route_after_extract,
+            "collect_requirements",
+            route_after_collect,
+            path_map={"validate_requirements": "validate_requirements"},
+        )
+        graph.add_conditional_edges(
+            "validate_requirements",
+            route_after_validate,
             path_map={
-                "extract_booking_requirements": "extract_booking_requirements",
-                "extract_specific_restaurant": "extract_specific_restaurant",
-                "ask_search_plan_revision": "ask_search_plan_revision",
-                "ask_questions": "ask_questions",
+                "elicitation_await_user": "elicitation_await_user",
                 "confirm_search_plan": "confirm_search_plan",
+                "ask_search_plan_revision": "ask_search_plan_revision",
+                "extract_booking_requirements": "extract_booking_requirements",
+                "resolve_specific_restaurant": "resolve_specific_restaurant",
                 "load_afisha_candidate_urls": "load_afisha_candidate_urls",
             },
         )
-        graph.add_edge("ask_questions", END)
-        graph.add_edge("ask_search_plan_revision", END)
+
+        graph.add_edge("elicitation_await_user", END)
         graph.add_edge("confirm_search_plan", END)
-        graph.add_conditional_edges(
-            "extract_specific_restaurant",
-            lambda s: "ask_specific_restaurant_questions"
-            if (s.get("specific_restaurant_missing_fields") or [])
-            else "resolve_specific_restaurant",
-            path_map={
-                "ask_specific_restaurant_questions": "ask_specific_restaurant_questions",
-                "resolve_specific_restaurant": "resolve_specific_restaurant",
-            },
-        )
-        graph.add_edge("ask_specific_restaurant_questions", END)
+        graph.add_edge("ask_search_plan_revision", END)
         graph.add_edge("resolve_specific_restaurant", END)
         graph.add_conditional_edges(
             "extract_booking_requirements",
@@ -2250,6 +3252,14 @@ class GraphRunner:
         )
         graph.add_edge("ask_booking_questions", END)
         graph.add_edge("create_reservation", END)
+
+        # После confirm — выбираем ветку поиска или конкретного ресторана
+        # confirm_search_plan оканчивается END выше — подтверждение происходит
+        # через client_action="confirm_search_plan" в следующем HTTP-запросе.
+        # В том запросе collect сразу читает search_plan_confirmed из контекста
+        # и направляется в нужную ветку.  Маршрут из confirm нам не нужен.
+
+        # ── Пайплайн подбора (ветка search после confirm) ──────────────────
 
         graph.add_edge("load_afisha_candidate_urls", "fetch_afisha_cards")
         graph.add_edge("fetch_afisha_cards", "cuisine_prefilter")
@@ -2273,7 +3283,19 @@ class GraphRunner:
             path_map={"relax_fallback": "relax_fallback", "take_shortlist": "take_shortlist", "format_reply": "format_reply"},
         )
 
-        graph.add_edge("relax_fallback", "load_afisha_candidate_urls")
+        def route_after_relax(s: RecState) -> str:
+            if int(s.get("relax_attempts") or 0) >= 2 and str(s.get("reply") or "").strip():
+                return "format_reply"
+            return "load_afisha_candidate_urls"
+
+        graph.add_conditional_edges(
+            "relax_fallback",
+            route_after_relax,
+            path_map={
+                "format_reply": "format_reply",
+                "load_afisha_candidate_urls": "load_afisha_candidate_urls",
+            },
+        )
 
         def route_shortlist_reviews(s: RecState) -> str:
             sl = s.get("shortlist") or []
@@ -2347,6 +3369,17 @@ class GraphRunner:
             if isinstance(_ctx.get("preorder_cart_lines"), list)
             else [],
             "preorder_order_result": _ctx.get("preorder_order_result"),
+            "preorder_receipt_lines": _ctx.get("preorder_receipt_lines")
+            if isinstance(_ctx.get("preorder_receipt_lines"), list)
+            else [],
+            "preorder_receipt_total": _ctx.get("preorder_receipt_total"),
+            "receipt_booking_snapshot": (
+                _ctx.get("receipt_booking_snapshot")
+                if isinstance(_ctx.get("receipt_booking_snapshot"), dict)
+                else {}
+            ),
+            "save_receipt_offered": bool(_ctx.get("save_receipt_offered")),
+            "save_receipt_done": bool(_ctx.get("save_receipt_done")),
             "specific_restaurant_requirements": (
                 _ctx.get("specific_restaurant_requirements")
                 if isinstance(_ctx.get("specific_restaurant_requirements"), dict)
@@ -2356,6 +3389,28 @@ class GraphRunner:
                 str(x) for x in (_ctx.get("specific_restaurant_missing_fields") or []) if isinstance(x, str)
             ],
             "specific_restaurant_resolved": bool(_ctx.get("specific_restaurant_resolved")),
+            "last_elicitation": (
+                _ctx.get("last_elicitation")
+                if isinstance(_ctx.get("last_elicitation"), dict)
+                else {}
+            ),
+            "elicitation_turn": int(_ctx.get("elicitation_turn") or 0),
+            "elicitation_prior_turn": (
+                _ctx.get("elicitation_prior_turn")
+                if isinstance(_ctx.get("elicitation_prior_turn"), dict)
+                else {}
+            ),
+            "missing_globally": [
+                str(x) for x in (_ctx.get("missing_globally") or []) if isinstance(x, str)
+            ],
+            "unresolved_from_last_question": [
+                str(x)
+                for x in (_ctx.get("unresolved_from_last_question") or [])
+                if isinstance(x, str)
+            ],
+            "not_yet_prompted": [
+                str(x) for x in (_ctx.get("not_yet_prompted") or []) if isinstance(x, str)
+            ],
             "client_time_zone": (
                 str(_ctx.get("client_time_zone")).strip()[:128]
                 if isinstance(_ctx.get("client_time_zone"), str) and str(_ctx.get("client_time_zone")).strip()
@@ -2381,7 +3436,27 @@ class GraphRunner:
         trace_batch_id = str(uuid.uuid4())
         # Default LangGraph limit (25) is too low: search path includes up to two relax
         # cycles (load→…→formal_rank→relax→load…), which exceeds 25 node steps.
-        result_state = await app.ainvoke(initial_state, config={"recursion_limit": 100})
+        try:
+            result_state = await asyncio.wait_for(
+                app.ainvoke(initial_state, config={"recursion_limit": 100}),
+                timeout=_dialog_graph_invoke_timeout_s(),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "dialog graph invoke timed out after %.0fs session_id=%s",
+                _dialog_graph_invoke_timeout_s(),
+                session_id,
+            )
+            result_state = {
+                **initial_state,
+                "reply": _COLLECT_LLM_RECOVERY_REPLY,
+                "current_node": "elicitation_await_user",
+                "pipeline_trace": _trace_append(
+                    initial_state,
+                    "dialog_timeout",
+                    {"timeout_s": _dialog_graph_invoke_timeout_s()},
+                ),
+            }
 
         reply = str(result_state.get("reply") or "")
         trace_events = list(result_state.get("pipeline_trace") or [])
@@ -2410,10 +3485,13 @@ class GraphRunner:
             messages=messages,
             reply=reply,
         )
+        client_context = sanitize_context_for_client(
+            {k: v for k, v in final_context.items() if k not in _ctx_exclude}
+        )
         await self.state_repository.update_current_node_and_context(
             session_id=session_id,
             current_node=str(result_state.get("current_node") or "format_reply"),
-            context={k: v for k, v in final_context.items() if k not in _ctx_exclude},
+            context=client_context,
         )
 
         updated_state = await self.state_repository.get_state_for_session(session_id)

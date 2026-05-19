@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from ..storage.state_repository import StateRepository
 from .llm import LLMClientRegistry
+from .receipt_booking_snapshot import build_receipt_booking_snapshot
 from .preorder_service import (
     build_toka_order_payload,
     compact_menu_for_llm,
@@ -18,13 +22,26 @@ from .preorder_service import (
     menu_tree_has_positions,
     parse_llm_menu_pick_json,
     preorder_cart_total,
+    preorder_menu_pick_response_format,
     wants_llm_pick_phrase,
     wants_open_menu_phrase,
 )
 
 logger = logging.getLogger(__name__)
 
+PREORDER_LLM_NODE = "preorder_menu_pick"
+PREORDER_PIPELINE_STAGE_LLM_PICK = "preorder_llm_pick"
+_PREORDER_LLM_RAW_MAX_CHARS = 50_000
 _PREORDER_ACTIVE = frozenset({"offer", "mode_choice", "browsing", "summary"})
+
+
+@dataclass(frozen=True)
+class PreorderLlmPickOutcome:
+    picks: List[Dict[str, Any]]
+    raw: Optional[str]
+    ok: bool
+    error: Optional[str]
+    model: Optional[str]
 
 
 def _last_user_text(messages: List[Dict[str, Any]]) -> str:
@@ -57,30 +74,112 @@ async def _llm_pick_items(
     user_instruction: str,
     *,
     current_cart_json: str = "[]",
-) -> List[Dict[str, Any]]:
-    llm_client, _sys, node_params = llm_registry.get_default_node()
+    guest_count: int = 1,
+) -> PreorderLlmPickOutcome:
+    llm_client, system_prompt, node_params = llm_registry.get_node_or_default(PREORDER_LLM_NODE)
+    model = str(node_params.get("model") or "") or None
     cat = json.dumps(menu_compact, ensure_ascii=False)
     prompt = (
-        "Ты помощник по выбору блюд из меню ресторана. Верни ТОЛЬКО JSON без markdown.\n"
-        "Формат: {\"items\":[{\"menu_item_id\":\"uuid\",\"quantity\":1}]}\n"
-        "quantity — целое от 1 до 10. Выбирай только id из списка каталога.\n"
+        "Подбери позиции из каталога под пожелания пользователя.\n"
+        f"Гостей за столом: {max(1, guest_count)}.\n"
         f"Текущая корзина (можно заменить полностью): {current_cart_json}\n"
-        f"Пожелания пользователя: {user_instruction}\n"
-        f"Каталог (id, title, price, section):\n{cat[:120000]}\n"
+        f"Пожелания: {user_instruction}\n"
+        f"Каталог (id, title, price, section, nutrition, portion, ingredients, …):\n{cat}\n"
     )
-    params = {**node_params, "response_format": {"type": "json_object"}}
-    try:
-        raw = await llm_client.chat(
-            messages=[
-                {"role": "system", "content": "Отвечай только валидным JSON-объектом с ключом items."},
-                {"role": "user", "content": prompt},
-            ],
-            **params,
+    sys_content = (system_prompt or "").strip() or (
+        "Подбери блюда из каталога. Ответ — только JSON по схеме structured output (ключ items)."
+    )
+    messages = [
+        {"role": "system", "content": sys_content},
+        {"role": "user", "content": prompt},
+    ]
+    raw: Optional[str] = None
+    last_exc: Optional[Exception] = None
+    for fmt_params in (
+        preorder_menu_pick_response_format(strict=True),
+        preorder_menu_pick_response_format(strict=False),
+        {"response_format": {"type": "json_object"}},
+    ):
+        try:
+            raw = await llm_client.chat(
+                messages=messages,
+                **{**node_params, **fmt_params},
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            logger.debug(
+                "preorder LLM pick response_format retry after: %s",
+                exc,
+            )
+    if raw is None:
+        logger.warning("preorder LLM pick failed: %s", last_exc)
+        return PreorderLlmPickOutcome(
+            picks=[],
+            raw=None,
+            ok=False,
+            error=str(last_exc)[:500] if last_exc else "LLM call failed",
+            model=model,
         )
-    except Exception as exc:
-        logger.warning("preorder LLM pick failed: %s", exc)
-        return []
-    return parse_llm_menu_pick_json(raw or "")
+    raw_s = raw or ""
+    picks = parse_llm_menu_pick_json(raw_s)
+    return PreorderLlmPickOutcome(
+        picks=picks,
+        raw=raw_s,
+        ok=True,
+        error=None,
+        model=model,
+    )
+
+
+async def _record_preorder_llm_pick_event(
+    state_repository: StateRepository,
+    session_id: str,
+    *,
+    source: str,
+    preferences: str,
+    guest_count: int,
+    menu_positions_count: int,
+    outcome: PreorderLlmPickOutcome,
+    cart_lines: List[Dict[str, Any]],
+) -> None:
+    """Append preorder LLM pick trace to pipeline_events (same body shape as graph trace)."""
+    raw = outcome.raw or ""
+    if len(raw) > _PREORDER_LLM_RAW_MAX_CHARS:
+        raw = raw[:_PREORDER_LLM_RAW_MAX_CHARS] + "…[truncated]"
+    event = {
+        "stage": PREORDER_PIPELINE_STAGE_LLM_PICK,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "payload": {
+            "source": source,
+            "preferences": (preferences or "")[:4000],
+            "guest_count": max(1, guest_count),
+            "menu_positions_count": menu_positions_count,
+            "llm_node": PREORDER_LLM_NODE,
+            "model": outcome.model,
+            "ok": outcome.ok,
+            "error": outcome.error,
+            "raw": raw,
+            "picks": outcome.picks,
+            "picks_count": len(outcome.picks),
+            "cart_lines_count": len(cart_lines),
+            "cart_lines": [
+                {
+                    "menu_item_id": ln.get("menu_item_id"),
+                    "quantity": ln.get("quantity"),
+                    "title": ln.get("title"),
+                    "price": ln.get("price"),
+                }
+                for ln in cart_lines
+                if isinstance(ln, dict)
+            ],
+        },
+    }
+    await state_repository.append_pipeline_events(
+        session_id,
+        str(uuid.uuid4()),
+        [event],
+    )
 
 
 def _refinement_heuristic(text: str) -> bool:
@@ -229,8 +328,18 @@ async def try_handle_preorder_dialog(
                     {"preorder_phase": "mode_choice"},
                 )
             compact = compact_menu_for_llm(tree)
-            picks = await _llm_pick_items(llm_registry, compact, prefs)
-            lines = lines_from_menu_item_ids(tree, picks)
+            outcome = await _llm_pick_items(llm_registry, compact, prefs, guest_count=guest_count)
+            lines = lines_from_menu_item_ids(tree, outcome.picks)
+            await _record_preorder_llm_pick_event(
+                state_repository,
+                session_id,
+                source="mode_choice",
+                preferences=prefs,
+                guest_count=guest_count,
+                menu_positions_count=len(compact),
+                outcome=outcome,
+                cart_lines=lines,
+            )
             if not lines:
                 return await _persist(
                     state_repository,
@@ -326,13 +435,25 @@ async def try_handle_preorder_dialog(
                 [{"menu_item_id": x.get("menu_item_id"), "quantity": x.get("quantity")} for x in cart_lines if isinstance(x, dict)],
                 ensure_ascii=False,
             )
-            picks = await _llm_pick_items(
+            refine_instruction = f"Учти текущую корзину и пожелание пользователя. {last_user}"
+            outcome = await _llm_pick_items(
                 llm_registry,
                 compact,
-                f"Учти текущую корзину и пожелание пользователя. {last_user}",
+                refine_instruction,
                 current_cart_json=current_json,
+                guest_count=guest_count,
             )
-            lines = lines_from_menu_item_ids(tree, picks)
+            lines = lines_from_menu_item_ids(tree, outcome.picks)
+            await _record_preorder_llm_pick_event(
+                state_repository,
+                session_id,
+                source="browsing_refine",
+                preferences=refine_instruction,
+                guest_count=guest_count,
+                menu_positions_count=len(compact),
+                outcome=outcome,
+                cart_lines=lines,
+            )
             if lines:
                 return await _persist(
                     state_repository,
@@ -397,10 +518,15 @@ async def try_handle_preorder_dialog(
                     "preorder_summary",
                     {"preorder_phase": "summary"},
                 )
-            total = preorder_cart_total([x for x in lines if isinstance(x, dict)])
+            norm_lines = [x for x in lines if isinstance(x, dict)]
+            total = preorder_cart_total(norm_lines)
             raw = out.get("raw") if isinstance(out, dict) else out
             _ = raw
-            ok_msg = f"Предзаказ на сумму {total:.0f} ₽ успешно оформлен."
+            ok_msg = (
+                f"Предзаказ на сумму {total:.0f} ₽ успешно оформлен.\n\n"
+                "Сохранить данные о брони и заказе в PDF? "
+                "Напишите «да», «ок» — или нажмите «Сохранить»."
+            )
             return await _persist(
                 state_repository,
                 session_id,
@@ -410,6 +536,11 @@ async def try_handle_preorder_dialog(
                 {
                     "preorder_phase": "done",
                     "preorder_cart_lines": [],
+                    "preorder_receipt_lines": norm_lines,
+                    "preorder_receipt_total": total,
+                    "receipt_booking_snapshot": build_receipt_booking_snapshot(ctx),
+                    "save_receipt_offered": True,
+                    "save_receipt_done": False,
                     "preorder_order_result": out if isinstance(out, dict) else {"raw": out},
                 },
             )

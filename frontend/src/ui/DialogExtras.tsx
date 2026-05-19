@@ -217,30 +217,12 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
   }
 
   const showRecommendations = list.length > 0;
-  const confirmation = {
-    restaurantName:
-      firstNonEmpty(
-        selected?.name,
-        reservationString(reservation, "restaurant_name"),
-        reservationString(reservation, "name")
-      ) ?? "—",
-    restaurantAddress:
-      firstNonEmpty(
-        selected?.address,
-        reservationString(reservation, "restaurant_address"),
-        reservationString(reservation, "address")
-      ) ?? "—",
-    bookingTime:
-      formatMaybeIso(
-        firstNonEmpty(bookingReq?.starts_at, reservation?.starts_at) ?? ""
-      ) || "—",
-    guestName:
-      firstNonEmpty(bookingReq?.guest_name, reservation?.guest_name) ?? "—",
-    guestPhone:
-      firstNonEmpty(bookingReq?.guest_phone, reservation?.guest_phone) ?? "—",
-    tableTitle:
-      firstNonEmpty(reservationString(reservation, "table_title")) ?? "—"
-  };
+  const bookingRestaurantName =
+    firstNonEmpty(
+      selected?.name,
+      reservationString(reservation, "restaurant_name"),
+      reservationString(reservation, "name")
+    ) ?? "—";
 
   const handleBookingSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -352,12 +334,6 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
                             Карточка ресторана на Afisha
                           </a>
                         )}
-                        {typeof c.toka_capacity_message === "string" &&
-                          c.toka_capacity_message.trim() && (
-                            <p className="restaurant-card-toka-hint" role="note">
-                              {c.toka_capacity_message}
-                            </p>
-                          )}
                         {bookingPending && !bookingComplete && (
                           <button
                             type="button"
@@ -391,7 +367,7 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
           {showBooking && (
             <form className="booking-form" onSubmit={handleBookingSubmit}>
               <div className="booking-form-title">
-                Бронирование «{bookingRestaurantTitle(confirmation.restaurantName)}»
+                Бронирование «{bookingRestaurantTitle(bookingRestaurantName)}»
               </div>
               <label className="booking-field">
                 <span>Дата и время</span>
@@ -467,35 +443,6 @@ export const DialogExtras: React.FC<DialogExtrasProps> = ({
             </form>
           )}
 
-          {bookingComplete && (
-            <div className="booking-confirmation" role="status" aria-live="polite">
-              <div className="booking-confirmation-title">Подтверждение бронирования</div>
-              <div className="booking-confirmation-row">
-                <span>Ресторан</span>
-                <strong>{confirmation.restaurantName}</strong>
-              </div>
-              <div className="booking-confirmation-row">
-                <span>Адрес</span>
-                <strong>{confirmation.restaurantAddress}</strong>
-              </div>
-              <div className="booking-confirmation-row">
-                <span>Время</span>
-                <strong>{confirmation.bookingTime}</strong>
-              </div>
-              <div className="booking-confirmation-row">
-                <span>Стол</span>
-                <strong>{confirmation.tableTitle}</strong>
-              </div>
-              <div className="booking-confirmation-row">
-                <span>Имя</span>
-                <strong>{confirmation.guestName}</strong>
-              </div>
-              <div className="booking-confirmation-row">
-                <span>Телефон</span>
-                <strong>{confirmation.guestPhone}</strong>
-              </div>
-            </div>
-          )}
         </>
       )}
     </div>

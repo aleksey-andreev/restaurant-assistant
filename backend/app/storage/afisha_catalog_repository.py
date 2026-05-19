@@ -9,12 +9,21 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 
-from .models import AfishaRestaurant, CityDistrict
+from .models import AfishaRestaurant, CityDistrict, CityMetroStation
 
 
 def norm_city_district_key(label: str) -> str:
     """Lowercase single-spaced key; must match geo_gate token normalization for districts."""
     return re.sub(r"\s+", " ", (label or "").strip().lower())
+
+
+def norm_metro_station_key(label: str) -> str:
+    """Normalized key for metro lookup (ё→е, lower, strip м./метро prefixes)."""
+    from app.services.osm_geo import _normalize_metro_station_name
+
+    display = _normalize_metro_station_name(label) or (label or "").strip()
+    t = re.sub(r"\s+", " ", display).strip().lower()
+    return t.replace("ё", "е")
 
 
 def _prefetch_ready_expr() -> Any:
@@ -587,6 +596,99 @@ class AfishaCatalogRepository:
             {"district_label": str(r.district_label), "district_norm": str(r.district_norm)}
             for r in rows
         ]
+
+    def list_city_metro_stations(self, city_slug: str) -> List[Dict[str, str]]:
+        with self._session_maker() as db:  # type: Session
+            rows = (
+                db.query(CityMetroStation)
+                .filter(CityMetroStation.city_slug == str(city_slug or "").strip().lower())
+                .order_by(CityMetroStation.station_label.asc())
+                .all()
+            )
+        return [
+            {"station_label": str(r.station_label), "station_norm": str(r.station_norm)}
+            for r in rows
+        ]
+
+    def list_distinct_metro_names(self, city_slug: str, *, limit: int = 500) -> List[str]:
+        """
+        Metro station labels for a city: ``city_metro_stations`` if seeded, else catalog OSM tags.
+        """
+        slug = str(city_slug or "").strip().lower()
+        if not slug:
+            return []
+        seeded = self.list_city_metro_stations(slug)
+        if seeded:
+            return [r["station_label"] for r in seeded][: max(1, min(int(limit), 2000))]
+
+        from sqlalchemy import text
+
+        lim = max(1, min(int(limit), 2000))
+        sql = text(
+            """
+            SELECT DISTINCT btrim(elem) AS name
+            FROM afisha_restaurants,
+                 jsonb_array_elements_text(geo_osm_metros) AS elem
+            WHERE city_slug = :slug
+              AND geo_osm_metros IS NOT NULL
+              AND btrim(elem) <> ''
+            ORDER BY name
+            LIMIT :lim
+            """
+        )
+        with self._session_maker() as db:  # type: Session
+            rows = db.execute(sql, {"slug": slug, "lim": lim}).fetchall()
+        return [str(r[0]) for r in rows if r and r[0]]
+
+    def seed_city_metro_stations(
+        self,
+        city_slug: str,
+        station_labels: Iterable[str],
+        *,
+        replace: bool = False,
+        source: str = "manual",
+    ) -> int:
+        slug = str(city_slug or "").strip().lower()
+        if not slug:
+            return 0
+        uniq: Dict[str, str] = {}
+        for raw in station_labels:
+            if not isinstance(raw, str):
+                continue
+            label = raw.strip()
+            if not label or label.startswith("#"):
+                continue
+            nk = norm_metro_station_key(label)
+            if not nk:
+                continue
+            uniq.setdefault(nk, label)
+        if not uniq:
+            return 0
+        now = datetime.utcnow()
+        src = str(source or "manual").strip()[:64] or "manual"
+        with self._session_maker() as db:  # type: Session
+            if replace:
+                db.query(CityMetroStation).filter(CityMetroStation.city_slug == slug).delete(
+                    synchronize_session=False
+                )
+            ck = [
+                {
+                    "city_slug": slug,
+                    "station_label": lbl,
+                    "station_norm": nk,
+                    "source": src,
+                    "created_at": now,
+                }
+                for nk, lbl in uniq.items()
+            ]
+            step = 200
+            for i in range(0, len(ck), step):
+                chunk = ck[i : i + step]
+                stmt = pg_insert(CityMetroStation).values(chunk)
+                stmt = stmt.on_conflict_do_nothing(constraint="uq_city_metro_stations_city_norm")
+                db.execute(stmt)
+            db.commit()
+        return len(uniq)
 
     def seed_city_districts(
         self,

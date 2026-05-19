@@ -17,10 +17,6 @@ export type RestaurantCandidate = {
   } | null;
   final_score?: number | null;
   formal_score?: number | null;
-  /** true if Toka halls confirm a table fits party_size; omitted/falsey if unverified */
-  toka_capacity_verified?: boolean | null;
-  /** Shown when стол could not be confirmed in Toka (stub/env/API) */
-  toka_capacity_message?: string | null;
 };
 
 export type RecommendationRequirements = {
@@ -90,6 +86,19 @@ export type DialogContext = {
   preorder_guest_count?: number | null;
   preorder_cart_lines?: PreorderCartLine[] | null;
   preorder_order_result?: Record<string, unknown> | null;
+  preorder_receipt_lines?: PreorderCartLine[] | null;
+  preorder_receipt_total?: number | null;
+  receipt_booking_snapshot?: {
+    restaurant_name?: string | null;
+    restaurant_address?: string | null;
+    starts_at?: string | null;
+    table_title?: string | null;
+    guest_name?: string | null;
+    guest_phone?: string | null;
+    guest_count?: number | null;
+  } | null;
+  save_receipt_offered?: boolean | null;
+  save_receipt_done?: boolean | null;
   specific_restaurant_requirements?: {
     name?: string | null;
     city?: string | null;

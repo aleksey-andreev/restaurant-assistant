@@ -3,8 +3,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from typing import Any, Dict, List, Optional
-
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 def menu_tree_has_positions(menu_tree: Dict[str, Any]) -> bool:
     """True if Toka menus/tree response has at least one sellable row with menu_item_id."""
@@ -24,6 +23,155 @@ def iter_menu_positions(menu_tree: Dict[str, Any]) -> List[Dict[str, Any]]:
             if isinstance(root, dict):
                 _walk_menu_node(root, card_name, "", out)
     return out
+
+
+def _iter_menu_items_raw(menu_tree: Dict[str, Any]) -> Iterator[Tuple[Dict[str, Any], str, str]]:
+    """Yield (menu_item dict, card_name, path) for every sellable row."""
+    for card in menu_tree.get("items") or []:
+        if not isinstance(card, dict):
+            continue
+        card_name = str(card.get("name") or "").strip()
+        for root in card.get("tree") or []:
+            if isinstance(root, dict):
+                yield from _walk_menu_items_raw(root, card_name, "")
+
+
+def _walk_menu_items_raw(
+    node: Dict[str, Any],
+    card_name: str,
+    path: str,
+) -> Iterator[Tuple[Dict[str, Any], str, str]]:
+    name = str(node.get("name") or "").strip()
+    seg = f"{path} / {name}".strip(" /") if path else name
+    for item in node.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("menu_item_id")
+        if mid is None or str(mid).strip() == "":
+            continue
+        yield item, card_name, seg or card_name
+    for ch in node.get("children") or []:
+        if isinstance(ch, dict):
+            yield from _walk_menu_items_raw(ch, card_name, seg or path)
+
+
+def _slim_nutrition(*sources: Any) -> Optional[Dict[str, Any]]:
+    """KBJU from cpfc object and/or flat Calories/Protein/Fat/Hydrocarbons on item/product."""
+    aliases = (
+        ("calories", ("calories", "Calories")),
+        ("proteins", ("proteins", "Protein", "protein")),
+        ("fats", ("fats", "Fat", "fat")),
+        ("carbohydrates", ("carbohydrates", "Hydrocarbons", "hydrocarbons", "carbohydrate")),
+    )
+    out: Dict[str, Any] = {}
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        cpfc = src.get("cpfc")
+        if isinstance(cpfc, dict):
+            src = {**src, **cpfc}
+        for out_key, keys in aliases:
+            if out_key in out:
+                continue
+            for k in keys:
+                if k not in src or src[k] is None:
+                    continue
+                try:
+                    out[out_key] = float(src[k])
+                except (TypeError, ValueError):
+                    out[out_key] = src[k]
+                break
+    return out or None
+
+
+def _slim_ingredient_names(raw: Any) -> Optional[List[str]]:
+    if not isinstance(raw, list):
+        return None
+    names: List[str] = []
+    for ing in raw:
+        if not isinstance(ing, dict):
+            continue
+        ipc = ing.get("ingredient_product_class")
+        if isinstance(ipc, dict):
+            nm = str(ipc.get("name") or "").strip()
+        else:
+            nm = str(ing.get("name") or "").strip()
+        if nm and nm not in names:
+            names.append(nm)
+    return names or None
+
+
+def _portion_block(item: Dict[str, Any], product: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    block: Dict[str, Any] = {}
+    for src in (item, product):
+        for key in ("output", "output_measure", "netto", "measure_name"):
+            val = src.get(key)
+            if val is None or val == "" or val == 0 or val == 0.0:
+                continue
+            out_key = "measure" if key == "measure_name" else key
+            if out_key not in block:
+                block[out_key] = val
+    return block or None
+
+
+def slim_menu_item_for_llm(
+    item: Dict[str, Any],
+    *,
+    section: str,
+    path: str,
+) -> Dict[str, Any]:
+    """Compact menu row for LLM: criteria-relevant fields only (no colors, ids, images)."""
+    product = item.get("product") if isinstance(item.get("product"), dict) else {}
+    mid = str(item.get("menu_item_id") or "").strip()
+    title = str(item.get("title") or product.get("name") or "").strip() or "—"
+    try:
+        price = float(item.get("price") if item.get("price") is not None else product.get("price") or 0.0)
+    except (TypeError, ValueError):
+        price = 0.0
+
+    row: Dict[str, Any] = {
+        "id": mid,
+        "title": title,
+        "price": price,
+        "section": section,
+    }
+    if path and path != section:
+        row["path"] = path
+
+    desc = product.get("description") or item.get("description")
+    if isinstance(desc, str) and desc.strip():
+        row["description"] = desc.strip()[:2000]
+
+    cat = product.get("category_name") or item.get("category")
+    if isinstance(cat, str) and cat.strip():
+        row["category"] = cat.strip()
+
+    nutrition = _slim_nutrition(item, product)
+    if nutrition:
+        row["nutrition"] = nutrition
+
+    portion = _portion_block(item, product)
+    if portion:
+        row["portion"] = portion
+
+    ingredients = _slim_ingredient_names(product.get("ingredients"))
+    if ingredients:
+        row["ingredients"] = ingredients
+
+    if product.get("is_age_limited") is True or item.get("is_age_limited") is True:
+        row["age_limited"] = True
+    if product.get("is_excisable") is True:
+        row["excisable"] = True
+    try:
+        abv = product.get("alcohol_by_volume")
+        if abv is not None and float(abv) > 0:
+            row["alcohol_by_volume"] = float(abv)
+    except (TypeError, ValueError):
+        pass
+    if product.get("need_to_weigh") is True:
+        row["sold_by_weight"] = True
+
+    return row
 
 
 def _walk_menu_node(
@@ -60,19 +208,12 @@ def _walk_menu_node(
             _walk_menu_node(ch, card_name, seg or path, out)
 
 
-def compact_menu_for_llm(menu_tree: Dict[str, Any], *, limit: int = 350) -> List[Dict[str, Any]]:
-    rows = iter_menu_positions(menu_tree)
-    slim: List[Dict[str, Any]] = []
-    for r in rows[:limit]:
-        slim.append(
-            {
-                "id": r["menu_item_id"],
-                "title": r["title"],
-                "price": r["price"],
-                "section": r.get("section") or "",
-            }
-        )
-    return slim
+def compact_menu_for_llm(menu_tree: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """All menu positions, slimmed for LLM (nutrition, portion, ingredients; no UI noise)."""
+    return [
+        slim_menu_item_for_llm(item, section=card_name, path=seg or card_name)
+        for item, card_name, seg in _iter_menu_items_raw(menu_tree)
+    ]
 
 
 def lines_from_menu_item_ids(
@@ -243,15 +384,69 @@ def wants_llm_pick_phrase(text: str) -> bool:
     )
 
 
+def preorder_menu_pick_response_format(*, strict: bool = True) -> Dict[str, Any]:
+    """OpenAI-compatible structured output for preorder LLM pick (GLM json_schema)."""
+    schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "menu_item_id": {"type": "string"},
+                        "quantity": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 10,
+                        },
+                    },
+                    "required": ["menu_item_id", "quantity"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+    json_schema: Dict[str, Any] = {
+        "name": "preorder_menu_pick",
+        "schema": schema,
+    }
+    if strict:
+        json_schema["strict"] = True
+    return {
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": json_schema,
+        }
+    }
+
+
+def normalize_llm_json_text(raw: str) -> str:
+    """Strip markdown fences and isolate a JSON object from model text."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```\s*$", "", s.strip())
+    if s and s[0] not in "{[":
+        m = re.search(r"\{[\s\S]*\}", s)
+        if m:
+            s = m.group(0)
+    return s.strip()
+
+
 def parse_llm_menu_pick_json(raw: str) -> List[Dict[str, Any]]:
     """Expect JSON object with key items: [{menu_item_id, quantity}, ...]."""
-    s = (raw or "").strip()
+    s = normalize_llm_json_text(raw)
     if not s:
         return []
     try:
         data = json.loads(s)
     except json.JSONDecodeError:
-        m = re.search(r"\{[\s\S]*\}\s*$", s)
+        m = re.search(r"\{[\s\S]*\}", s)
         if not m:
             return []
         try:
