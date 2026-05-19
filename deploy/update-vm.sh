@@ -2,13 +2,18 @@
 set -euo pipefail
 
 # One-shot VM update:
-# 1) Pull latest main
+# 1) Pull chosen branch (default: main)
 # 2) Optionally restore DB from dump (--restore-db)
 # 3) Rebuild and restart docker compose stack
 #
 # Run from anywhere:
-#   bash deploy/update-vm.sh              # git + docker only (no DB restore)
-#   bash deploy/update-vm.sh --restore-db # also pg_restore from dump
+#   bash deploy/update-vm.sh                    # main, git + docker only
+#   bash deploy/update-vm.sh --branch alpha     # test branch
+#   BRANCH=alpha bash deploy/update-vm.sh       # same via env
+#   bash deploy/update-vm.sh --restore-db       # also pg_restore from dump
+#
+# When switching branches for testing, do not pass --restore-db unless you intend
+# to replace the live database from the repo dump.
 #
 # Optional env (restore step only):
 #   CLEAN_TARGET=1      # passed to restore script (default: 1)
@@ -22,6 +27,7 @@ cd "${ROOT_DIR}"
 
 COMPOSE_FILE="docker-compose.prod.yml"
 DUMP_FILE="${DUMP_FILE:-backend/db_dumps/restaurant_assistant_no_session_logs.dump}"
+BRANCH="${BRANCH:-main}"
 RESTORE_DB=0
 export CLEAN_TARGET="${CLEAN_TARGET:-1}"
 
@@ -32,17 +38,34 @@ Usage: bash deploy/update-vm.sh [options]
   Default: pull main from origin, rebuild and restart docker compose (no DB dump).
 
 Options:
+  --branch NAME    Git branch to deploy (default: main; same as BRANCH=...).
   --restore-db     Restore PostgreSQL from DUMP_FILE (see env below).
   --dump-file PATH Override dump path for this run (same as DUMP_FILE=...).
   -h, --help       Show this help.
 
+Environment:
+  BRANCH           Branch to deploy if --branch is not passed (default: main).
+
 Environment (restore only):
   DUMP_FILE, CLEAN_TARGET, ENV_FILE, TARGET_DATABASE_URL
+
+Notes:
+  init_db on backend startup may alter schema when deploying a newer branch.
+  Rolling back with --branch main does not undo database changes; back up PostgreSQL
+  before testing another branch if schema or data may differ.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --branch)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --branch requires a name." >&2
+        exit 1
+      fi
+      BRANCH="$2"
+      shift 2
+      ;;
     --restore-db)
       RESTORE_DB=1
       shift
@@ -76,10 +99,14 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> Updating repository (main)"
+echo "==> Updating repository (${BRANCH})"
 git fetch origin
-git checkout main
-git pull --ff-only origin main
+if ! git show-ref --verify --quiet "refs/remotes/origin/${BRANCH}"; then
+  echo "ERROR: origin/${BRANCH} not found after fetch. Push the branch or check the name." >&2
+  exit 1
+fi
+git checkout "${BRANCH}"
+git pull --ff-only origin "${BRANCH}"
 
 if [[ "${RESTORE_DB}" -eq 1 ]]; then
   if [[ ! -f "${DUMP_FILE}" ]]; then
