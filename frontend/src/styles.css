@@ -27,7 +27,7 @@
   --radius-md: 16px;
   --radius-sm: 12px;
   --radius-pill: 999px;
-  --header-sticky-offset: 5.2rem;
+  --header-sticky-offset: 6.3rem;
   --toolbar-gap-from-header: 0.7rem;
 }
 
@@ -779,7 +779,7 @@ body {
 
 @media (min-width: 768px) {
   :root {
-    --header-sticky-offset: 5.9rem;
+    --header-sticky-offset: 7.5rem;
     --toolbar-gap-from-header: 0.8rem;
   }
 
