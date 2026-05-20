@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -16,6 +16,8 @@ from .toka_client import (
 )
 from ..storage.database import get_session_maker
 from ..storage.toka_binding_repository import lookup_binding_dto_sync
+
+_OPEN_ORDER_STATUSES = ("active", "cooking", "cooked")
 
 
 def _ok(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -117,12 +119,39 @@ def _tables_sorted_by_capacity(halls_payload: Dict[str, Any], guest_count: int) 
     return cand
 
 
+def _order_status_blocks_table(status: Optional[str]) -> bool:
+    return (status or "").strip().lower() in _OPEN_ORDER_STATUSES
+
+
+async def _load_open_order_table_ids(client: TokaBackofficeClient, store_id: str) -> Set[str]:
+    """Table ids with a non-closed Toka order (blocks reservation per Toka API)."""
+    blocked: Set[str] = set()
+    for status in _OPEN_ORDER_STATUSES:
+        raw = await client.list_orders(store_id, status=status)
+        rows = raw.get("items") or []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if not _order_status_blocks_table(row.get("status")):
+                continue
+            tid = row.get("table_id")
+            if tid is not None and str(tid).strip():
+                blocked.add(str(tid))
+    return blocked
+
+
 def _table_available_for_interval(
     table_id: str,
     interval_start: datetime,
     interval_end: datetime,
     reservations: List[Dict[str, Any]],
+    *,
+    open_order_table_ids: Optional[Set[str]] = None,
 ) -> bool:
+    if open_order_table_ids is not None and str(table_id) in open_order_table_ids:
+        return False
     for r in reservations:
         if str(r.get("table_id")) != str(table_id):
             continue
@@ -137,17 +166,59 @@ def _table_available_for_interval(
     return True
 
 
+def _list_free_table_ids_for_booking(
+    halls_payload: Dict[str, Any],
+    guest_count: int,
+    interval_start: datetime,
+    interval_end: datetime,
+    reservations: List[Dict[str, Any]],
+    *,
+    open_order_table_ids: Optional[Set[str]] = None,
+) -> List[str]:
+    out: List[str] = []
+    for tid, _ in _tables_sorted_by_capacity(halls_payload, guest_count):
+        if _table_available_for_interval(
+            tid,
+            interval_start,
+            interval_end,
+            reservations,
+            open_order_table_ids=open_order_table_ids,
+        ):
+            out.append(tid)
+    return out
+
+
 def _pick_smallest_free_table_id(
     halls_payload: Dict[str, Any],
     guest_count: int,
     interval_start: datetime,
     interval_end: datetime,
     reservations: List[Dict[str, Any]],
+    *,
+    open_order_table_ids: Optional[Set[str]] = None,
 ) -> Optional[str]:
-    for tid, _ in _tables_sorted_by_capacity(halls_payload, guest_count):
-        if _table_available_for_interval(tid, interval_start, interval_end, reservations):
-            return tid
-    return None
+    ids = _list_free_table_ids_for_booking(
+        halls_payload,
+        guest_count,
+        interval_start,
+        interval_end,
+        reservations,
+        open_order_table_ids=open_order_table_ids,
+    )
+    return ids[0] if ids else None
+
+
+def _is_reservation_table_conflict_message(message: str) -> bool:
+    """Toka 409 cases where another table may still work (auto-pick retry)."""
+    msg = (message or "").lower()
+    return any(
+        phrase in msg
+        for phrase in (
+            "open order",
+            "already reserved",
+            "table has an open order",
+        )
+    )
 
 
 def _toka_list_date_str(starts_at: str, client_time_zone: Optional[str]) -> str:
@@ -484,6 +555,7 @@ class TokaMcpAgent:
             interval_end = interval_start + timedelta(minutes=dur)
             date_str = _toka_list_date_str(starts_at, client_time_zone)
             reservations_list = await _load_reservations_for_toka_date(client, org_id, st_id, date_str)
+            open_order_table_ids = await _load_open_order_table_ids(client, st_id)
         except TokaClientError as exc:
             return _err("TOKA_API_ERROR", str(exc), retriable=True)
         except Exception as exc:
@@ -499,7 +571,13 @@ class TokaMcpAgent:
                     {"id": tid, "title": title, "capacity": cap, "status": "too_small", "free_after": None}
                 )
                 continue
-            if _table_available_for_interval(tid, interval_start, interval_end, reservations_list):
+            if _table_available_for_interval(
+                tid,
+                interval_start,
+                interval_end,
+                reservations_list,
+                open_order_table_ids=open_order_table_ids,
+            ):
                 tables_out.append({"id": tid, "title": title, "capacity": cap, "status": "free", "free_after": None})
             else:
                 mx = _max_blocking_end_utc(tid, interval_start, interval_end, reservations_list)
@@ -566,6 +644,7 @@ class TokaMcpAgent:
             interval_end = interval_start + timedelta(minutes=dur)
             date_str = _toka_list_date_str(starts_at, client_time_zone)
             reservations_list = await _load_reservations_for_toka_date(client, org_id, st_id, date_str)
+            open_order_table_ids = await _load_open_order_table_ids(client, st_id)
         except httpx.TimeoutException as exc:
             msg = str(exc).strip() or f"Toka HTTP timeout ({type(exc).__name__})"
             return _err("TOKA_API_ERROR", msg, retriable=True)
@@ -575,6 +654,7 @@ class TokaMcpAgent:
             msg = str(exc).strip() or repr(exc)
             return _err("TOKA_UNKNOWN_ERROR", msg, retriable=True)
 
+        explicit_table = bool(table_id and str(table_id).strip())
         table_id_str: Optional[str] = str(table_id).strip() if table_id else None
         if table_id_str:
             cap = find_table_capacity(halls_raw, table_id_str)
@@ -591,21 +671,24 @@ class TokaMcpAgent:
                 interval_start,
                 interval_end,
                 reservations_list,
+                open_order_table_ids=open_order_table_ids,
             ):
                 return _err(
                     "NO_TABLE_AVAILABLE",
                     "Table is not free for the requested time slot",
                     retriable=False,
                 )
+            candidate_table_ids = [table_id_str]
         else:
-            table_id_str = _pick_smallest_free_table_id(
+            candidate_table_ids = _list_free_table_ids_for_booking(
                 halls_raw,
                 int(guest_count),
                 interval_start,
                 interval_end,
                 reservations_list,
+                open_order_table_ids=open_order_table_ids,
             )
-            if not table_id_str:
+            if not candidate_table_ids:
                 return _err(
                     "NO_TABLE_AVAILABLE",
                     "No free table with enough capacity for requested time slot",
@@ -613,7 +696,6 @@ class TokaMcpAgent:
                 )
 
         payload = {
-            "table_id": table_id_str,
             "starts_at": starts_at,
             "duration_minutes": dur,
             "guest_name": guest_name,
@@ -622,16 +704,47 @@ class TokaMcpAgent:
             "notes": notes or "",
             "source": "agent",
         }
-        try:
-            reservation = await client.create_reservation(org_id, st_id, payload)
-        except httpx.TimeoutException as exc:
-            msg = str(exc).strip() or f"Toka HTTP timeout ({type(exc).__name__})"
-            return _err("TOKA_API_ERROR", msg, retriable=True)
-        except TokaClientError as exc:
-            return _err("TOKA_API_ERROR", str(exc), retriable=True)
-        except Exception as exc:
-            msg = str(exc).strip() or repr(exc)
-            return _err("TOKA_UNKNOWN_ERROR", msg, retriable=True)
+        reservation: Optional[Dict[str, Any]] = None
+        last_conflict_msg: Optional[str] = None
+        for attempt_idx, attempt_tid in enumerate(candidate_table_ids):
+            payload["table_id"] = attempt_tid
+            try:
+                reservation = await client.create_reservation(org_id, st_id, payload)
+                table_id_str = attempt_tid
+                break
+            except httpx.TimeoutException as exc:
+                msg = str(exc).strip() or f"Toka HTTP timeout ({type(exc).__name__})"
+                return _err("TOKA_API_ERROR", msg, retriable=True)
+            except TokaClientError as exc:
+                msg = str(exc)
+                retriable_conflict = (
+                    not explicit_table
+                    and _is_reservation_table_conflict_message(msg)
+                    and attempt_idx + 1 < len(candidate_table_ids)
+                )
+                if retriable_conflict:
+                    last_conflict_msg = msg
+                    continue
+                if not explicit_table and _is_reservation_table_conflict_message(msg):
+                    last_conflict_msg = msg
+                    break
+                return _err("TOKA_API_ERROR", msg, retriable=True)
+            except Exception as exc:
+                msg = str(exc).strip() or repr(exc)
+                return _err("TOKA_UNKNOWN_ERROR", msg, retriable=True)
+
+        if reservation is None:
+            if last_conflict_msg:
+                return _err(
+                    "NO_TABLE_AVAILABLE",
+                    "No free table with enough capacity for requested time slot",
+                    retriable=False,
+                )
+            return _err(
+                "NO_TABLE_AVAILABLE",
+                "No free table with enough capacity for requested time slot",
+                retriable=False,
+            )
 
         reservation_id = reservation.get("id") or reservation.get("reservation_id") or reservation.get("code")
         table_title_str = find_table_title(halls_raw, str(table_id_str))

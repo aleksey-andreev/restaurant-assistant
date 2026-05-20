@@ -41,8 +41,7 @@ def fingerprint_search_plan(req: Dict[str, Any]) -> str:
 
     if intent == "named_restaurant":
         name = (req.get("restaurant_name") or "").strip().lower()
-        hint = (req.get("address_or_hint") or "").strip().lower()
-        payload = {"intent": "named_restaurant", "city": city, "name": name, "hint": hint}
+        payload = {"intent": "named_restaurant", "city": city, "name": name}
         return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
     # intent == "search"
@@ -84,6 +83,80 @@ def fingerprint_search_plan(req: Dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
 
+_NAMED_REQUIRED_ASK_SLOTS = frozenset({"city", "restaurant_name"})
+
+
+def should_defer_named_restaurant_resolve(state: Dict[str, Any], req: Dict[str, Any]) -> bool:
+    """
+    Same HTTP turn: collect asked for a required named-restaurant slot; defer resolve
+    so the user sees the elicitation reply (validate may still be incomplete).
+    """
+    if (req.get("intent") or "search") != "named_restaurant":
+        return False
+    last = dict(state.get("last_elicitation") or {})
+    asked = {
+        str(x).strip()
+        for x in (last.get("asked_slots") or [])
+        if isinstance(x, str) and str(x).strip()
+    }
+    if not (asked & _NAMED_REQUIRED_ASK_SLOTS):
+        return False
+    req_checked = attach_city_slug_from_reference(dict(req))
+    return bool(validate_recommendation_requirements_fields(req_checked))
+
+
+def sync_search_plan_confirm_after_req_merge(
+    *,
+    had_confirmed: bool,
+    old_fingerprint: Any,
+    new_req: Dict[str, Any],
+) -> tuple[bool, str]:
+    """Invalidate plan confirmation when search fingerprint changes after user edits criteria."""
+    new_fp = fingerprint_search_plan(new_req)
+    old_fp = old_fingerprint if isinstance(old_fingerprint, str) and old_fingerprint.strip() else None
+    if had_confirmed and old_fp is not None and new_fp != old_fp:
+        return False, new_fp
+    return had_confirmed, new_fp
+
+
+def resolve_specific_restaurant_trace_payload(
+    *,
+    status: str,
+    name: str,
+    city_slug: str,
+    candidate_count: int,
+    db_match_count: int = 0,
+    match_mode: str = "",
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "status": status,
+        "candidate_count": candidate_count,
+        "db_match_count": db_match_count,
+        "match_mode": match_mode or None,
+        "name": name or None,
+        "city_slug": city_slug or None,
+    }
+    if extra:
+        body.update(extra)
+    return body
+
+
+def named_restaurant_not_found_reply(req: Dict[str, Any], *, resolve_attempts: int) -> str:
+    """User-facing copy when the Afisha catalog has no confident match (DB-only search)."""
+    name = str(req.get("restaurant_name") or "").strip() or "этот ресторан"
+    city = str(req.get("city") or "").strip() or "выбранном городе"
+    if resolve_attempts <= 1:
+        return (
+            f"В каталоге для {city} не нашёл ресторан «{name}». "
+            "Проверьте написание названия или укажите другое имя."
+        )
+    return (
+        f"Снова не нашёл «{name}» в каталоге ({city}). "
+        "Могу подобрать похожие рестораны — напишите, например, кухню или район."
+    )
+
+
 def format_search_plan_summary(req: Dict[str, Any], *, include_confirmation_hint: bool = True) -> str:
     """
     Human-readable plan for user confirmation.
@@ -94,14 +167,11 @@ def format_search_plan_summary(req: Dict[str, Any], *, include_confirmation_hint
     if intent == "named_restaurant":
         name = str(req.get("restaurant_name") or "").strip() or "—"
         city = str(req.get("city") or "").strip() or "—"
-        hint = str(req.get("address_or_hint") or "").strip()
         lines = [
             "Бронирование конкретного ресторана (проверьте и подтвердите):",
             f"- Ресторан: {name}",
             f"- Город: {city}",
         ]
-        if hint:
-            lines.append(f"- Ориентир/адрес: {hint}")
         if include_confirmation_hint:
             lines.extend([
                 "",
@@ -1601,9 +1671,12 @@ class GraphRunner:
             from .toka_specific_restaurant_resolver import resolve_specific_restaurant_candidates
 
             req = resolver_req_for_named_restaurant(state)
+            rec_req = dict(state.get("recommendation_requirements") or {})
             name = str(req.get("name") or "").strip()
             city_slug = str(req.get("city_slug") or "").strip()
-            hint = str(req.get("address_or_hint") or "").strip()
+            location_hint = str(req.get("address_or_hint") or "").strip()
+            trace_kw = {"db_match_count": 0, "match_mode": ""}
+
             if not name or not city_slug:
                 return {
                     **state,
@@ -1617,23 +1690,23 @@ class GraphRunner:
                     "pipeline_trace": _trace_append(
                         state,
                         "resolve_specific_restaurant",
-                        {
-                            "status": "invalid_requirements",
-                            "name": name or None,
-                            "city_slug": city_slug or None,
-                        },
+                        resolve_specific_restaurant_trace_payload(
+                            status="invalid_requirements",
+                            name=name,
+                            city_slug=city_slug,
+                            candidate_count=0,
+                        ),
                     ),
                 }
 
             resolved = await resolve_specific_restaurant_candidates(
                 city_slug=city_slug,
                 restaurant_name=name,
-                address_hint=hint,
-                city_label=str(req.get("city") or "").strip() or city_slug,
-                llm_chat=llm_client.chat,
-                llm_node_params=dict(node_params),
+                address_hint=location_hint,
             )
             status = str(resolved.get("status") or "")
+            trace_kw["db_match_count"] = int(resolved.get("db_match_count") or 0)
+            trace_kw["match_mode"] = str(resolved.get("match_mode") or "")
             candidates = [x for x in (resolved.get("candidates") or []) if isinstance(x, dict)]
             selected = resolved.get("selected") if isinstance(resolved.get("selected"), dict) else None
             errors = list(state.get("service_errors") or [])
@@ -1650,6 +1723,7 @@ class GraphRunner:
                     "booking_missing_fields": ["starts_at", "guest_count", "guest_name", "guest_phone"],
                     "booking_errors": [],
                     "specific_restaurant_resolved": True,
+                    "specific_resolve_attempts": 0,
                     "final_recommendations": [selected],
                     "recommendations": [selected],
                     "shortlist": [selected],
@@ -1657,7 +1731,13 @@ class GraphRunner:
                     "pipeline_trace": _trace_append(
                         state,
                         "resolve_specific_restaurant",
-                        {"status": status, "candidate_count": 1},
+                        resolve_specific_restaurant_trace_payload(
+                            status=status,
+                            name=name,
+                            city_slug=city_slug,
+                            candidate_count=1,
+                            **trace_kw,
+                        ),
                     ),
                 }
 
@@ -1666,8 +1746,8 @@ class GraphRunner:
                     **state,
                     "current_node": "resolve_specific_restaurant",
                     "reply": (
-                        "Нашёл несколько похожих ресторанов. "
-                        "Выберите нужный вариант в карточках ниже, и затем заполните форму бронирования."
+                        "В каталоге нашёл несколько похожих названий. "
+                        "Выберите нужный вариант в карточках ниже и заполните форму бронирования."
                     ),
                     "booking_pending": True,
                     "booking_selected_candidate": {},
@@ -1682,23 +1762,34 @@ class GraphRunner:
                     "pipeline_trace": _trace_append(
                         state,
                         "resolve_specific_restaurant",
-                        {"status": status, "candidate_count": len(candidates)},
+                        resolve_specific_restaurant_trace_payload(
+                            status=status,
+                            name=name,
+                            city_slug=city_slug,
+                            candidate_count=len(candidates),
+                            **trace_kw,
+                        ),
                     ),
                 }
 
+            attempts = int(state.get("specific_resolve_attempts") or 0) + 1
             return {
                 **state,
                 "current_node": "resolve_specific_restaurant",
-                "reply": (
-                    "Не удалось однозначно найти этот ресторан. "
-                    "Уточните, пожалуйста, адрес/район или пришлите ссылку на карточку."
-                ),
+                "reply": named_restaurant_not_found_reply(rec_req, resolve_attempts=attempts),
                 "specific_restaurant_resolved": False,
+                "specific_resolve_attempts": attempts,
                 "service_errors": errors,
                 "pipeline_trace": _trace_append(
                     state,
                     "resolve_specific_restaurant",
-                    {"status": status or "not_found", "candidate_count": len(candidates)},
+                    resolve_specific_restaurant_trace_payload(
+                        status=status or "not_found",
+                        name=name,
+                        city_slug=city_slug,
+                        candidate_count=len(candidates),
+                        **trace_kw,
+                    ),
                 ),
             }
 
@@ -2892,8 +2983,6 @@ class GraphRunner:
                 '  "restaurant_name": string | null,\n'
                 '  "city": string | null,\n'
                 '  "city_slug": null,\n'
-                '  "address_or_hint": string | null,\n'
-                '  "source_url": string | null,\n'
                 '  "location": {"type": "metro"|"area"|"none", "value": string|null} | null,\n'
                 '  "party_size": number | null,\n'
                 '  "budget_range": {"min": number, "max": number} | null,\n'
@@ -2911,11 +3000,13 @@ class GraphRunner:
                 "- city_slug всегда null (slug подставит система).\n"
                 f"- Поддерживаемые города: {supported_cities}. "
                 "Если город не из списка — city null.\n"
-                "- intent='named_restaurant' если назван конкретный ресторан.\n"
+                "- intent='named_restaurant' если назван конкретный ресторан (бронь по имени).\n"
+                "- Для named_restaurant не спрашивай район, метро, адрес, ссылку — только город "
+                "и название, если их нет.\n"
                 "- user_reply — твой ответ ассистентом; не копируй дословно последнее сообщение "
                 "пользователя. Если критериев не хватает — вежливо уточни недостающее.\n"
-                "- asked_slots — поля, о которых спрашиваешь в user_reply: "
-                "['city', 'restaurant_name', 'location_or_cuisine']; иначе [].\n\n"
+                "- asked_slots — для named_restaurant только ['city'] и/или ['restaurant_name']; "
+                "для search — ['city', 'location_or_cuisine'] и др.; иначе [].\n\n"
                 "Пример. «Забронируй ресторан Ипполит» →\n"
                 '{"intent":"named_restaurant","restaurant_name":"Ипполит","city":null,'
                 '"city_slug":null,"user_reply":"Понял, Ипполит. В каком городе он?",'
@@ -3050,6 +3141,11 @@ class GraphRunner:
             spec_sync = resolver_req_for_named_restaurant(
                 {**state, "recommendation_requirements": new_req}
             )
+            confirmed_out, fp_out = sync_search_plan_confirm_after_req_merge(
+                had_confirmed=bool(state.get("search_plan_confirmed")),
+                old_fingerprint=state.get("search_plan_fingerprint"),
+                new_req=new_req,
+            )
 
             return {
                 **state,
@@ -3062,6 +3158,8 @@ class GraphRunner:
                 "reply": user_reply,
                 "last_elicitation": {"text": user_reply, "asked_slots": asked_slots_new},
                 "elicitation_turn": turn + 1,
+                "search_plan_confirmed": confirmed_out,
+                "search_plan_fingerprint": fp_out,
                 "missing_globally": [],
                 "unresolved_from_last_question": [],
                 "not_yet_prompted": [],
@@ -3090,6 +3188,8 @@ class GraphRunner:
                         "location_meta": loc_meta,
                         "location_tools": location_tool_trace,
                         "requirements_complete": req_complete,
+                        "search_plan_confirmed": confirmed_out,
+                        "search_plan_fingerprint": fp_out,
                     },
                 ),
             }
@@ -3215,6 +3315,8 @@ class GraphRunner:
             if bool(s.get("search_plan_confirmed")):
                 intent = req.get("intent") or "search"
                 if intent == "named_restaurant":
+                    if should_defer_named_restaurant_resolve(s, req if isinstance(req, dict) else {}):
+                        return "elicitation_await_user"
                     return "resolve_specific_restaurant"
                 return "load_afisha_candidate_urls"
             # Требования полные, план ещё не подтверждён — показываем confirm

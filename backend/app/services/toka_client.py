@@ -354,6 +354,22 @@ class TokaBackofficeClient:
             raise TokaClientError("create_order: empty store_id")
         return await self.request_json("POST", f"/api/orders/{sid}", json=payload)
 
+    async def list_orders(
+        self,
+        store_id: str,
+        *,
+        status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Store orders; optional ``status`` filter (e.g. active, cooking, cooked)."""
+        sid = (store_id or "").strip()
+        if not sid:
+            raise TokaClientError("list_orders: empty store_id")
+        params: Dict[str, Any] = {}
+        st = (status or "").strip()
+        if st:
+            params["status"] = st
+        return await self.request_json("GET", f"/api/orders/{sid}", params=params or None)
+
     async def list_reservations(
         self,
         organization_id: str,

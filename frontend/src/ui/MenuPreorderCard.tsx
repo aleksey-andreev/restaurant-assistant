@@ -62,6 +62,8 @@ function walk(node: Record<string, unknown>, cardName: string, out: MenuPos[]): 
   }
 }
 
+const QTY_MAX = 99;
+
 export const MenuPreorderCard: React.FC<MenuPreorderCardProps> = ({
   organizationId,
   storeId,
@@ -137,6 +139,35 @@ export const MenuPreorderCard: React.FC<MenuPreorderCardProps> = ({
     });
   }, []);
 
+  const incrementItem = useCallback((id: string) => {
+    setSelected(prev => {
+      const cur = prev.get(id) ?? 0;
+      if (cur >= QTY_MAX) return prev;
+      const n = new Map(prev);
+      n.set(id, cur < 1 ? 1 : cur + 1);
+      return n;
+    });
+  }, []);
+
+  const decrementItem = useCallback((id: string) => {
+    setSelected(prev => {
+      const cur = prev.get(id);
+      if (!cur || cur <= 1) {
+        const n = new Map(prev);
+        n.delete(id);
+        return n;
+      }
+      const n = new Map(prev);
+      n.set(id, cur - 1);
+      return n;
+    });
+  }, []);
+
+  const stopRowClick = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
   const totals = useMemo(() => {
     let count = 0;
     let sum = 0;
@@ -190,6 +221,7 @@ export const MenuPreorderCard: React.FC<MenuPreorderCardProps> = ({
                 <div className="menu-preorder-node-body">
                   {items.map(p => {
                     const checked = selected.has(p.menu_item_id);
+                    const qty = selected.get(p.menu_item_id) ?? 1;
                     return (
                       <label
                         key={p.menu_item_id}
@@ -202,7 +234,38 @@ export const MenuPreorderCard: React.FC<MenuPreorderCardProps> = ({
                           className="menu-preorder-checkbox"
                         />
                         <span className="menu-preorder-item-title">{p.title}</span>
-                        <span className="menu-preorder-item-price">{Math.round(p.price)} ₽</span>
+                        <span className="menu-preorder-item-right">
+                          {checked && (
+                            <span
+                              className="menu-preorder-qty"
+                              role="group"
+                              aria-label={`Количество: ${p.title}`}
+                              onClick={stopRowClick}
+                            >
+                              <button
+                                type="button"
+                                className="menu-preorder-qty-btn"
+                                aria-label={`Уменьшить количество: ${p.title}`}
+                                onClick={() => decrementItem(p.menu_item_id)}
+                              >
+                                −
+                              </button>
+                              <span className="menu-preorder-qty-value" aria-live="polite">
+                                {qty}
+                              </span>
+                              <button
+                                type="button"
+                                className="menu-preorder-qty-btn"
+                                aria-label={`Увеличить количество: ${p.title}`}
+                                disabled={qty >= QTY_MAX}
+                                onClick={() => incrementItem(p.menu_item_id)}
+                              >
+                                +
+                              </button>
+                            </span>
+                          )}
+                          <span className="menu-preorder-item-price">{Math.round(p.price)} ₽</span>
+                        </span>
                       </label>
                     );
                   })}

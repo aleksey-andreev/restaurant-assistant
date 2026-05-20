@@ -187,6 +187,127 @@ class AfishaCatalogRepository:
             )
         return out
 
+    @staticmethod
+    def _normalize_restaurant_name_query(name: str) -> str:
+        return re.sub(r"\s+", " ", (name or "").strip().lower()).replace("ё", "е")
+
+    @staticmethod
+    def _restaurant_name_search_tokens(name: str) -> List[str]:
+        """Tokens for ILIKE OR search (full phrase + significant words)."""
+        n = AfishaCatalogRepository._normalize_restaurant_name_query(name)
+        if not n:
+            return []
+        tokens: List[str] = [n]
+        for part in re.findall(r"[\w\d]+", n, flags=re.UNICODE):
+            if len(part) >= 4 and part not in tokens:
+                tokens.append(part)
+        return tokens[:4]
+
+    def find_rows_for_city_by_restaurant_name(
+        self,
+        city_slug: str,
+        restaurant_name: str,
+        *,
+        limit: int = 8,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """
+        Catalog-only search for the named-restaurant flow.
+
+        Returns (rows, match_mode) where match_mode is ``ilike_phrase`` or ``ilike_tokens``.
+        """
+        city = str(city_slug or "").strip()
+        name = str(restaurant_name or "").strip()
+        if not city or not name:
+            return [], "empty"
+
+        lim = max(1, int(limit))
+        tokens = self._restaurant_name_search_tokens(name)
+        if not tokens:
+            return [], "empty"
+
+        def _base_query(db: Session):
+            return (
+                db.query(AfishaRestaurant)
+                .filter(AfishaRestaurant.city_slug == city)
+                .filter(AfishaRestaurant.venue_closed.is_(False))
+                .filter(AfishaRestaurant.name.isnot(None))
+                .filter(AfishaRestaurant.address.isnot(None))
+                .filter(func.btrim(AfishaRestaurant.address) != "")
+            )
+
+        def _rows_to_dicts(orows: List[AfishaRestaurant]) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for r in orows:
+                out.append(
+                    {
+                        "url": r.url,
+                        "name": r.name,
+                        "address": r.address,
+                        "metro": r.metro,
+                        "tags": r.tags,
+                        "avg_check": r.avg_check,
+                        "flags": r.flags,
+                        "venue_closed": r.venue_closed,
+                        "open_now": r.open_now,
+                        "card_extras": r.card_extras,
+                        "geo_inferred_metro": r.geo_inferred_metro,
+                        "geo_inferred_area": r.geo_inferred_area,
+                        "geo_osm_metros": r.geo_osm_metros,
+                        "geo_llm_at": r.geo_llm_at.isoformat() if r.geo_llm_at else None,
+                        "geo_osm_at": r.geo_osm_at.isoformat() if r.geo_osm_at else None,
+                        "yandex_rating": r.yandex_rating,
+                        "yandex_rating_confidence": r.yandex_rating_confidence,
+                        "yandex_rating_at": r.yandex_rating_at.isoformat()
+                        if r.yandex_rating_at
+                        else None,
+                    }
+                )
+            return out
+
+        phrase = tokens[0]
+        escaped_phrase = self._escape_ilike_pattern(phrase)
+        pattern_phrase = f"%{escaped_phrase}%"
+
+        with self._session_maker() as db:  # type: Session
+            orows = (
+                _base_query(db)
+                .filter(AfishaRestaurant.name.ilike(pattern_phrase, escape="\\"))
+                .order_by(AfishaRestaurant.url.asc())
+                .limit(lim)
+                .all()
+            )
+        if orows:
+            return _rows_to_dicts(orows), "ilike_phrase"
+
+        if len(tokens) == 1:
+            return [], "ilike_phrase"
+
+        clauses = []
+        for tok in tokens:
+            escaped = self._escape_ilike_pattern(tok)
+            clauses.append(AfishaRestaurant.name.ilike(f"%{escaped}%", escape="\\"))
+
+        with self._session_maker() as db:  # type: Session
+            orows = (
+                _base_query(db)
+                .filter(or_(*clauses))
+                .order_by(AfishaRestaurant.url.asc())
+                .limit(lim * 2)
+                .all()
+            )
+
+        seen_urls: set[str] = set()
+        deduped: List[AfishaRestaurant] = []
+        for r in orows:
+            if r.url in seen_urls:
+                continue
+            seen_urls.add(r.url)
+            deduped.append(r)
+            if len(deduped) >= lim:
+                break
+
+        return _rows_to_dicts(deduped), "ilike_tokens"
+
     def count_for_city(self, city_slug: str) -> int:
         with self._session_maker() as db:  # type: Session
             return (

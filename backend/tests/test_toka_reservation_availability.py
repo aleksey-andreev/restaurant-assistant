@@ -9,6 +9,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from app.services.toka_mcp_agent import (  # noqa: E402
     _dates_for_reservation_fetch,
+    _is_reservation_table_conflict_message,
+    _list_free_table_ids_for_booking,
     _max_blocking_end_utc,
     _pick_smallest_free_table_id,
     _status_blocks_table,
@@ -35,6 +37,51 @@ class TokaReservationAvailabilityTest(unittest.TestCase):
         e = datetime(2026, 5, 9, 1, 0, tzinfo=z)
         days = _dates_for_reservation_fetch(s, e)
         self.assertEqual(days, ["2026-05-08", "2026-05-09"])
+
+    def test_list_free_table_ids_order(self) -> None:
+        z = timezone.utc
+        halls = {
+            "items": [
+                {
+                    "tables": [
+                        {"id": "t4", "capacity": 4},
+                        {"id": "t2", "capacity": 2},
+                    ]
+                }
+            ]
+        }
+        new_s = datetime(2026, 5, 8, 12, 0, tzinfo=z)
+        new_e = new_s + timedelta(hours=2)
+        ids = _list_free_table_ids_for_booking(halls, 2, new_s, new_e, [])
+        self.assertEqual(ids, ["t2", "t4"])
+
+    def test_reservation_table_conflict_message(self) -> None:
+        self.assertTrue(_is_reservation_table_conflict_message("Table has an open order"))
+        self.assertTrue(_is_reservation_table_conflict_message("Table is already reserved"))
+        self.assertFalse(_is_reservation_table_conflict_message("Toka API error 500"))
+
+    def test_open_order_blocks_table(self) -> None:
+        z = timezone.utc
+        halls = {
+            "items": [
+                {
+                    "tables": [
+                        {"id": "t2", "capacity": 2},
+                        {"id": "t4", "capacity": 4},
+                    ]
+                }
+            ]
+        }
+        new_s = datetime(2026, 5, 8, 12, 0, tzinfo=z)
+        new_e = new_s + timedelta(hours=2)
+        blocked = {"t2"}
+        self.assertFalse(
+            _table_available_for_interval("t2", new_s, new_e, [], open_order_table_ids=blocked)
+        )
+        tid = _pick_smallest_free_table_id(
+            halls, 2, new_s, new_e, [], open_order_table_ids=blocked
+        )
+        self.assertEqual(tid, "t4")
 
     def test_pick_smallest_skips_occupied_table(self) -> None:
         z = timezone.utc

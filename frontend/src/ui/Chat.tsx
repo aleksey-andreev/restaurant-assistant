@@ -15,10 +15,17 @@ import {
 } from "../lib/receiptData";
 import { generateBookingReceiptPdf } from "../lib/generateBookingReceiptPdf";
 import { MenuPreorderCard } from "./MenuPreorderCard";
+import {
+  createWelcomeMessage,
+  dialogApiMessages,
+  isWelcomeMessage
+} from "../lib/chatCopy";
 
 type Message = {
   role: "user" | "assistant";
   content: string;
+  /** Local-only greeting; excluded from `/api/dialog` payloads. */
+  welcome?: boolean;
 };
 
 type DialogResponse = {
@@ -54,7 +61,7 @@ type ChatProps = {
 
 function lastAssistantMessageIndex(messages: Message[]): number {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i].role === "assistant") return i;
+    if (messages[i].role === "assistant" && !isWelcomeMessage(messages[i])) return i;
   }
   return -1;
 }
@@ -68,7 +75,7 @@ function browserTimeZone(): string | undefined {
 }
 
 export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[]>(() => [createWelcomeMessage()]);
   const [dialogContext, setDialogContext] = useState<DialogContext | null>(null);
   /** Last persisted graph node from `/api/dialog` — same source as `current_node` on the server. */
   const [dialogCurrentNode, setDialogCurrentNode] = useState<string | null>(null);
@@ -113,7 +120,7 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
       options?: { suppressAssistantReply?: boolean }
     ) => {
       const body: Record<string, unknown> = {
-        messages: nextMessages.map(m => ({ role: m.role, content: m.content }))
+        messages: dialogApiMessages(nextMessages)
       };
       if (clientAction) {
         body.client_action = clientAction;
@@ -158,7 +165,7 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
         throw new Error(`HTTP ${resp.status}`);
       }
       const data = (await resp.json()) as { session_id: string };
-      setMessages([]);
+      setMessages([createWelcomeMessage()]);
       setDialogContext(null);
       setDialogCurrentNode(null);
       setInput("");
@@ -656,8 +663,9 @@ export const Chat: React.FC<ChatProps> = ({ sessionId, onSessionChange }) => {
               void send();
             }
           }}
-          placeholder="Опишите ваши предпочтения: кухня, бюджет, район, дата и время..."
-          rows={4}
+          placeholder="Сообщение…"
+          aria-label="Сообщение"
+          rows={3}
         />
         <button
           className="chat-send"

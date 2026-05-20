@@ -259,9 +259,8 @@ body {
   font-family: inherit;
   box-shadow: var(--shadow-sm);
   line-height: 1.45;
-  /* Taller on narrow viewports so long placeholder wraps without inner scrollbar. */
-  min-height: clamp(6.75rem, 5.25rem + 10vmin, 9rem);
-  max-height: min(40vh, 13rem);
+  min-height: clamp(3.25rem, 2.75rem + 4vmin, 4.5rem);
+  max-height: min(40vh, 10rem);
   overflow-y: auto;
 }
 
@@ -684,11 +683,58 @@ body {
 
 .menu-preorder-item-title {
   flex: 1 1 auto;
+  min-width: 0;
+}
+
+.menu-preorder-item-right {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-shrink: 0;
 }
 
 .menu-preorder-item-price {
   flex-shrink: 0;
   font-weight: 600;
+  white-space: nowrap;
+}
+
+.menu-preorder-qty {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+}
+
+.menu-preorder-qty-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  color: var(--text-primary);
+  font-size: 1.05rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.menu-preorder-qty-btn:hover:not(:disabled) {
+  background: var(--bg-subtle);
+}
+
+.menu-preorder-qty-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.menu-preorder-qty-value {
+  min-width: 1.35rem;
+  text-align: center;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 .menu-preorder-checkbox {
