@@ -119,6 +119,29 @@ class TestLocationReferenceMsk(unittest.TestCase):
         self.assertTrue(hits)
         self.assertEqual(hits[0]["district_label"], "Хамовники")
 
+    def test_apply_canonical_gorny_universitet_spb(self) -> None:
+        """User wording «Горный университет» → canonical «Горный институт»."""
+        req = {
+            "city_slug": "spb",
+            "intent": "search",
+            "location": {"type": "metro", "value": "Горный университет"},
+        }
+        metros = ["Горный институт", "Невский проспект"]
+        out, meta = apply_canonical_location_to_req(
+            req,
+            districts=SPB_DISTRICTS_FIXTURE,
+            metro_names=metros,
+        )
+        self.assertEqual(out["location"]["value"], "Горный институт")
+        self.assertIn("location_auto", meta)
+        miss = validate_recommendation_requirements_fields_with_location(
+            out,
+            districts=SPB_DISTRICTS_FIXTURE,
+            metro_names=metros,
+            base_validate=validate_recommendation_requirements_fields,
+        )
+        self.assertNotIn("location_or_cuisine", miss)
+
     def test_apply_canonical_metro(self) -> None:
         req = {
             "city_slug": "msk",

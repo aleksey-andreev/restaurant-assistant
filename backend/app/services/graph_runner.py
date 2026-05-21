@@ -31,6 +31,7 @@ from .search_plan_short_reply import classify_search_plan_short_reply
 
 logger = logging.getLogger(__name__)
 
+
 def fingerprint_search_plan(req: Dict[str, Any]) -> str:
     """
     Stable fingerprint for search-relevant requirement fields (confirm / invalidate).
@@ -353,6 +354,30 @@ def validate_recommendation_requirements_fields(req: Dict[str, Any]) -> List[str
     return missing
 
 
+def compute_global_requirements_missing(
+    req: Dict[str, Any],
+    *,
+    districts: Optional[List[Dict[str, str]]] = None,
+    metro_names: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Единая детерминированная проверка полноты критериев для collect / validate / confirm.
+
+    named_restaurant: city + restaurant_name (без метро/кухни).
+    search + справочник: каноническая локация через validate_*_with_location.
+    """
+    req_checked = attach_city_slug_from_reference(dict(req))
+    slug = str(req_checked.get("city_slug") or "").strip().lower()
+    if location_reference_enabled(slug) and districts:
+        return validate_recommendation_requirements_fields_with_location(
+            req_checked,
+            districts=districts,
+            metro_names=metro_names or [],
+            base_validate=validate_recommendation_requirements_fields,
+        )
+    return validate_recommendation_requirements_fields(req_checked)
+
+
 def compute_elicitation_validation_hints(
     req: Dict[str, Any],
     elicitation_prior: Optional[Dict[str, Any]] = None,
@@ -361,17 +386,11 @@ def compute_elicitation_validation_hints(
     metro_names: Optional[List[str]] = None,
 ) -> tuple[List[str], List[str], List[str]]:
     """missing, unresolved (answered but not accepted), not_yet (not asked last turn)."""
-    req_checked = attach_city_slug_from_reference(dict(req))
-    slug = str(req_checked.get("city_slug") or "").strip().lower()
-    if location_reference_enabled(slug) and (districts is not None or metro_names is not None):
-        missing = validate_recommendation_requirements_fields_with_location(
-            req_checked,
-            districts=districts or [],
-            metro_names=metro_names or [],
-            base_validate=validate_recommendation_requirements_fields,
-        )
-    else:
-        missing = validate_recommendation_requirements_fields(req_checked)
+    missing = compute_global_requirements_missing(
+        req,
+        districts=districts if districts else None,
+        metro_names=metro_names,
+    )
     prior_slots: set[str] = set()
     if elicitation_prior:
         prior_slots = {
@@ -394,6 +413,7 @@ def build_elicitation_user_reply(
     unresolved: List[str],
     not_yet: List[str],
     req: Dict[str, Any],
+    metro_suggest: Optional[str] = None,
 ) -> str:
     """Deterministic user-facing question when LLM user_reply is missing or echoed."""
     intent = str(req.get("intent") or "search")
@@ -414,6 +434,19 @@ def build_elicitation_user_reply(
         return "Как называется ресторан, который хотите забронировать?"
 
     if "location_or_cuisine" in missing:
+        loc = req.get("location")
+        if (
+            "location_or_cuisine" in unresolved
+            and metro_suggest
+            and isinstance(loc, dict)
+            and loc.get("type") == "metro"
+        ):
+            raw = str(loc.get("value") or "").strip()
+            if raw and raw != metro_suggest:
+                return (
+                    f"Станцию «{raw}» не удалось сопоставить со справочником. "
+                    f"Имеете в виду «{metro_suggest}»?"
+                )
         if "location_or_cuisine" in unresolved:
             return (
                 "Не удалось понять район, метро или тип кухни. "
@@ -452,6 +485,7 @@ def pick_elicitation_user_reply(
     missing_fb: List[str],
     unresolved_fb: List[str],
     not_yet_fb: List[str],
+    metro_suggest: Optional[str] = None,
 ) -> tuple[str, str, List[str]]:
     """
     LLM wording when user_reply is valid and not an echo; else deterministic templates.
@@ -474,6 +508,7 @@ def pick_elicitation_user_reply(
         unresolved=unresolved_fb,
         not_yet=not_yet_fb,
         req=new_req,
+        metro_suggest=metro_suggest,
     )
     asked_slots_new = [
         s for s in missing_fb if s in unresolved_fb or s in not_yet_fb
@@ -481,6 +516,13 @@ def pick_elicitation_user_reply(
     llm_slots = [str(x) for x in (parsed.get("asked_slots") or []) if isinstance(x, str)]
     if llm_slots:
         asked_slots_new = llm_slots
+
+    if (
+        metro_suggest
+        and "location_or_cuisine" in unresolved_fb
+        and template_reply
+    ):
+        return template_reply, "template_metro_clarify", asked_slots_new
 
     if llm_ok:
         return llm_reply, "llm_question", asked_slots_new
@@ -1024,35 +1066,7 @@ class GraphRunner:
                 return float(mn) >= 0 and float(mx) >= float(mn)
 
             def _missing_fields_for_req(req: Dict[str, Any]) -> List[str]:
-                out: List[str] = []
-                c = req.get("city")
-                city_has = isinstance(c, str) and bool(c.strip())
-                if not city_has:
-                    out.append("city")
-                ps = req.get("party_size")
-                ps_ok = False
-                if _is_num(ps):
-                    ps_ok = int(ps) >= 1
-                if not ps_ok:
-                    out.append("party_size")
-                if not _valid_stored_budget(req.get("budget_range")):
-                    out.append("budget_range")
-                loc = req.get("location")
-                loc_ok = False
-                if isinstance(loc, dict):
-                    lt = loc.get("type")
-                    lv = loc.get("value")
-                    if lt in {"metro", "area"} and isinstance(lv, str) and lv.strip():
-                        loc_ok = True
-                    elif lt == "none":
-                        loc_ok = True
-                if city_has and not loc_ok:
-                    out.append("location_or_metro")
-                slug = req.get("city_slug")
-                slug_ok = isinstance(slug, str) and bool(slug.strip())
-                if city_has and not slug_ok:
-                    out.append("city_slug")
-                return out
+                return compute_global_requirements_missing(req)
 
             if client_action and client_action.get("type") == "confirm_search_plan":
                 if bool(state.get("booking_pending")):
@@ -2095,25 +2109,35 @@ class GraphRunner:
                         ),
                     }
 
+            from .llm_geo_match import location_score_from_result, match_inferred_to_user
+
             kept = []
             dropped = 0
             for c in cands:
                 d = dict(c)
                 ok = False
+                geo_result = "no_match"
                 if loc_t == "area":
                     area_norm = _norm_token(d.get("geo_inferred_area"))
                     ok = area_norm == _norm_token(want_area_label)
+                    geo_result = "match" if ok else "no_match"
                 elif loc_t == "metro":
-                    metros = d.get("geo_osm_metros")
-                    metro_norms = (
-                        {_norm_token(x) for x in metros if isinstance(x, str) and x.strip()}
-                        if isinstance(metros, list)
-                        else set()
+                    osm_list = d.get("geo_osm_metros")
+                    extra_osm = (
+                        [str(x) for x in osm_list if isinstance(x, str) and x.strip()]
+                        if isinstance(osm_list, list)
+                        else None
                     )
-                    ok = want_norm in metro_norms
+                    geo_result = match_inferred_to_user(
+                        d.get("geo_inferred_metro"),
+                        d.get("geo_inferred_area"),
+                        loc,
+                        extra_metro_names=extra_osm,
+                    )
+                    ok = geo_result == "match"
                 if ok:
-                    d["llm_geo_result"] = "match"
-                    d["geo_location_score"] = 1.0
+                    d["llm_geo_result"] = geo_result
+                    d["geo_location_score"] = location_score_from_result(geo_result)
                     kept.append(d)
                 else:
                     dropped += 1
@@ -2840,6 +2864,17 @@ class GraphRunner:
             "requirements_elicitation"
         )
 
+        async def _location_ref_for_req(
+            req: Dict[str, Any],
+        ) -> tuple[List[Dict[str, str]], List[str]]:
+            checked = attach_city_slug_from_reference(dict(req))
+            slug = str(checked.get("city_slug") or "").strip().lower()
+            if not location_reference_enabled(slug) or catalog_repo is None:
+                return [], []
+            districts = await asyncio.to_thread(catalog_repo.list_city_districts, slug)
+            metros = await asyncio.to_thread(catalog_repo.list_distinct_metro_names, slug)
+            return districts, metros
+
         async def collect_requirements_node(state: RecState) -> RecState:
             """
             Один диалоговый ход: LLM-вызов для выявления критериев поиска.
@@ -2863,7 +2898,12 @@ class GraphRunner:
             # Обработка confirm_search_plan action (кнопка «Подтвердить»)
             if client_action and client_action.get("type") == "confirm_search_plan":
                 prev_req = attach_city_slug_from_reference(prev_req)
-                miss = validate_recommendation_requirements_fields(prev_req)
+                ref_d_confirm, ref_m_confirm = await _location_ref_for_req(prev_req)
+                miss = compute_global_requirements_missing(
+                    prev_req,
+                    districts=ref_d_confirm or None,
+                    metro_names=ref_m_confirm or None,
+                )
                 if not miss:
                     fp = fingerprint_search_plan(prev_req)
                     spec_sync = resolver_req_for_named_restaurant(
@@ -2881,6 +2921,8 @@ class GraphRunner:
                         "search_plan_fingerprint": fp,
                         "search_plan_revision_requested": False,
                         "missing_globally": [],
+                        "missing_fields": [],
+                        "requirements_complete": True,
                         "pipeline_trace": _trace_append(
                             state, "collect_requirements",
                             {"skipped_llm": True, "reason": "confirm_search_plan", "fingerprint": fp}
@@ -2892,6 +2934,8 @@ class GraphRunner:
                     "current_node": "collect_requirements",
                     "elicitation_prior_turn": elicitation_prior_turn,
                     "missing_globally": miss,
+                    "missing_fields": miss,
+                    "requirements_complete": False,
                     "search_plan_confirmed": False,
                     "pipeline_trace": _trace_append(
                         state, "collect_requirements",
@@ -2902,7 +2946,12 @@ class GraphRunner:
             # Обработка коротких ответов «да/нет» на confirm
             if not client_action and not bool(state.get("search_plan_confirmed")):
                 prev_req_slug = attach_city_slug_from_reference(prev_req)
-                miss_check = validate_recommendation_requirements_fields(prev_req_slug)
+                ref_d_short, ref_m_short = await _location_ref_for_req(prev_req_slug)
+                miss_check = compute_global_requirements_missing(
+                    prev_req_slug,
+                    districts=ref_d_short or None,
+                    metro_names=ref_m_short or None,
+                )
                 if not miss_check:
                     short = classify_search_plan_short_reply(_last_user_text())
                     if short == "affirm":
@@ -3079,17 +3128,16 @@ class GraphRunner:
             llm_retried = False
 
             def _req_complete(req: Dict[str, Any]) -> bool:
-                r = attach_city_slug_from_reference(dict(req))
-                if location_reference_enabled(str(r.get("city_slug") or "")):
-                    miss = validate_recommendation_requirements_fields_with_location(
-                        r,
-                        districts=ref_districts,
-                        metro_names=ref_metros,
-                        base_validate=validate_recommendation_requirements_fields,
+                return (
+                    len(
+                        compute_global_requirements_missing(
+                            req,
+                            districts=ref_districts if ref_districts else None,
+                            metro_names=ref_metros if ref_metros else None,
+                        )
                     )
-                else:
-                    miss = validate_recommendation_requirements_fields(r)
-                return len(miss) == 0
+                    == 0
+                )
 
             if (not llm_timed_out) and not parse_ok_first:
                 llm_retried = True
@@ -3128,6 +3176,12 @@ class GraphRunner:
                 metro_names=ref_metros if ref_metros else None,
             )
 
+            metro_suggest: Optional[str] = None
+            _ms = (loc_meta or {}).get("metro_search") or {}
+            _cands = _ms.get("candidates") if isinstance(_ms, dict) else None
+            if isinstance(_cands, list) and _cands:
+                metro_suggest = str(_cands[0].get("metro_name") or "").strip() or None
+
             user_reply, reply_source, asked_slots_new = pick_elicitation_user_reply(
                 parsed=parsed,
                 last_user_text=last_user_text,
@@ -3136,6 +3190,7 @@ class GraphRunner:
                 missing_fb=missing_fb,
                 unresolved_fb=unresolved_fb,
                 not_yet_fb=not_yet_fb,
+                metro_suggest=metro_suggest,
             )
 
             spec_sync = resolver_req_for_named_restaurant(
@@ -3205,23 +3260,12 @@ class GraphRunner:
             prior_elic = dict(state.get("elicitation_prior_turn") or {})
             prior_slots = list(prior_elic.get("asked_slots") or [])
 
-            ref_slug = str(req.get("city_slug") or "").strip().lower()
-            v_districts: List[Dict[str, str]] = []
-            v_metros: List[str] = []
-            if location_reference_enabled(ref_slug) and catalog_repo is not None:
-                v_districts = await asyncio.to_thread(catalog_repo.list_city_districts, ref_slug)
-                v_metros = await asyncio.to_thread(
-                    catalog_repo.list_distinct_metro_names, ref_slug
-                )
-            if location_reference_enabled(ref_slug) and v_districts:
-                missing = validate_recommendation_requirements_fields_with_location(
-                    req,
-                    districts=v_districts,
-                    metro_names=v_metros,
-                    base_validate=validate_recommendation_requirements_fields,
-                )
-            else:
-                missing = validate_recommendation_requirements_fields(req)
+            v_districts, v_metros = await _location_ref_for_req(req)
+            missing = compute_global_requirements_missing(
+                req,
+                districts=v_districts or None,
+                metro_names=v_metros or None,
+            )
             unresolved = [s for s in missing if s in set(prior_slots)]
             not_yet = [s for s in missing if s not in set(prior_slots)]
 
@@ -3229,6 +3273,7 @@ class GraphRunner:
                 **state,
                 "current_node": "validate_requirements",
                 "missing_globally": missing,
+                "missing_fields": missing,
                 "unresolved_from_last_question": unresolved,
                 "not_yet_prompted": not_yet,
                 "requirements_complete": len(missing) == 0,
@@ -3425,6 +3470,11 @@ class GraphRunner:
             booking_selected_initial = booking_selected_override
 
         _ctx: Dict[str, Any] = dict(graph_state.context or {})
+        _missing_unified = [
+            str(x)
+            for x in (_ctx.get("missing_globally") or _ctx.get("missing_fields") or [])
+            if isinstance(x, str)
+        ]
 
         def _ctx_candidate_list(key: str) -> List[Dict[str, Any]]:
             v = _ctx.get(key)
@@ -3437,8 +3487,12 @@ class GraphRunner:
             "current_node": graph_state.current_node,
             "reply": "",
             "recommendation_requirements": graph_state.context.get("recommendation_requirements") if graph_state.context else {},
-            "requirements_complete": False,
-            "missing_fields": [],
+            "requirements_complete": (
+                bool(_ctx.get("requirements_complete"))
+                if "requirements_complete" in _ctx
+                else len(_missing_unified) == 0
+            ),
+            "missing_fields": list(_missing_unified),
             "repeated_missing_fields": [],
             "requirements_prompt_count": int(_ctx.get("requirements_prompt_count") or 0),
             "search_plan_confirmed": bool(_ctx.get("search_plan_confirmed")),
@@ -3502,9 +3556,7 @@ class GraphRunner:
                 if isinstance(_ctx.get("elicitation_prior_turn"), dict)
                 else {}
             ),
-            "missing_globally": [
-                str(x) for x in (_ctx.get("missing_globally") or []) if isinstance(x, str)
-            ],
+            "missing_globally": list(_missing_unified),
             "unresolved_from_last_question": [
                 str(x)
                 for x in (_ctx.get("unresolved_from_last_question") or [])

@@ -28,7 +28,8 @@ _METRO_QUERY_EXAMPLES: Dict[str, str] = {
 }
 
 _DISTRICT_AUTO_PICK_MIN_SCORE = 0.78
-_METRO_AUTO_PICK_MIN_SCORE = 0.82
+_METRO_AUTO_PICK_MIN_SCORE = 0.72
+_METRO_STRONG_MATCH_MIN_GAP = 0.2
 
 def supported_location_reference_cities_hint() -> str:
     """Human-readable list for prompts (e.g. «Санкт-Петербург (spb), Москва (msk)»)."""
@@ -208,6 +209,23 @@ def location_reference_enabled(city_slug: Optional[str]) -> bool:
     return s in LOCATION_REFERENCE_CITY_SLUGS
 
 
+def resolve_metro_canonical_name(
+    query: str,
+    metro_names: List[str],
+    *,
+    min_score: float = _METRO_AUTO_PICK_MIN_SCORE,
+    min_gap: float = _METRO_STRONG_MATCH_MIN_GAP,
+) -> Optional[str]:
+    """Single strong metro match from справочник, else None (ambiguous / weak)."""
+    hits = search_metro(metro_names, query, limit=5)
+    if not hits or hits[0]["score"] < min_score:
+        return None
+    second_score = hits[1]["score"] if len(hits) > 1 else 0.0
+    if len(hits) > 1 and hits[0]["score"] - second_score < min_gap:
+        return None
+    return str(hits[0]["metro_name"])
+
+
 def location_is_canonical(
     loc: Dict[str, Any],
     *,
@@ -231,7 +249,9 @@ def location_is_canonical(
         return False
     v_norm = norm_metro_query(loc_v)
     metro_norms = {norm_metro_query(n) for n in metro_names if n}
-    return v_norm in metro_norms
+    if v_norm in metro_norms:
+        return True
+    return resolve_metro_canonical_name(loc_v, metro_names) is not None
 
 
 def apply_canonical_location_to_req(
@@ -270,10 +290,12 @@ def apply_canonical_location_to_req(
     elif loc_t == "metro":
         hits = search_metro(metro_names, raw_v, limit=5)
         meta["metro_search"] = {"query": raw_v, "candidates": hits}
-        if hits and hits[0]["score"] >= metro_min_score:
-            second_score = hits[1]["score"] if len(hits) > 1 else 0.0
-            if len(hits) == 1 or hits[0]["score"] - second_score >= 0.2:
-                out["location"] = {"type": "metro", "value": hits[0]["metro_name"]}
+        canonical = resolve_metro_canonical_name(
+            raw_v, metro_names, min_score=metro_min_score
+        )
+        if canonical:
+            out["location"] = {"type": "metro", "value": canonical}
+            if hits:
                 meta["location_auto"] = hits[0]
     return out, meta
 

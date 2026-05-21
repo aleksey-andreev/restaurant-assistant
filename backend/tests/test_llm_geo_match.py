@@ -99,6 +99,25 @@ class LlmGeoMatchHelpersTest(unittest.TestCase):
             "match",
         )
 
+    def test_match_gorny_institute_inferred_only(self) -> None:
+        """Catalog often has geo_inferred_metro but empty geo_osm_metros (SPB)."""
+        self.assertEqual(
+            match_inferred_to_user(
+                "Горный институт",
+                None,
+                {"type": "metro", "value": "Горный институт"},
+            ),
+            "match",
+        )
+        self.assertEqual(
+            match_inferred_to_user(
+                "Маяковская",
+                None,
+                {"type": "metro", "value": "Горный институт"},
+            ),
+            "no_match",
+        )
+
     def test_match_area(self) -> None:
         self.assertEqual(
             match_inferred_to_user(None, "Василеостровский", {"type": "area", "value": "Василеостровский"}),
